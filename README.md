@@ -1,5 +1,7 @@
 !!! WORK IN PROGRESS !!! Join the discord for uploading logs and setting up multiplayer sessions with friends or join lobbies here - https://discord.gg/WYTHXRYkb2
 
+Make sure to check for the most recent update in (releases) before trying to join lobbies
+
 Welcome to Starsector Multiplayer! 🚀
 
 People have been trying to make Starsector multiplayer happen for about 10 years, and this is a real attempt at it.
