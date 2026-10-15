@@ -1,5 +1,7 @@
 Edit - 10/15/2026 Build 1.6.2 is almost available doing a little more testing before releasing this build here. Check back later if its not available in releases or check our discord.
 
+many skeptics believe that what has already been done, cant be done. willing to pay for 3 videos showcasing combat and other features of this mod before full release
+
 !!! WORK IN PROGRESS !!! Join the discord for uploading logs and setting up multiplayer sessions with friends or join lobbies here - https://discord.gg/WYTHXRYkb2
 
 Make sure to check for the most recent update in (releases) before trying to join lobbies
