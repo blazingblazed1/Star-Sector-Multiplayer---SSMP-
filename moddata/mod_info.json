@@ -1,0 +1,11 @@
+{
+	"id":"starmp",
+	"name":"StarMP",
+	"author":"Mike",
+	"version":"@VERSION@",
+	"description":"SSMP (StarMP) @VERSION@ - Starsector co-op multiplayer over Iroh. No anti-cheat: play with people you trust.",
+	"gameVersion":"0.98a-RC8",
+	"jars":["jars/StarMP.jar"],
+	"modPlugin":"starmp.StarMPPlugin",
+	"utility":true
+}

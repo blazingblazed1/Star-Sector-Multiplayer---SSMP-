@@ -1,0 +1,5 @@
+build/
+dist/
+StarMP.jar
+rust-smnet/target/
+*.class
