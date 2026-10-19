@@ -1,4 +1,4 @@
-== SSMP 0.9.4.1 ==
+== SSMP 0.9.4.4 ==
 
 SSMP (StarMP) - Starsector co-op multiplayer over Iroh peer-to-peer (no VPN or port forwarding needed)
 Up to 10 players (tested live with 4). Starsector 0.98a-RC8.
@@ -75,10 +75,10 @@ Logs: Starsector\saves\common\starmp_log.txt.data   and   starsector-core\starse
 
 Debug log, crash report and bug reports (diagnostics builds only - not active in this build):
   - While the game runs, "StarMP crash report - DO NOT DELETE - <name> - <time>.txt" sits in the folder
-    mods\StarMP\crash logs\<your name> with the last ~30 seconds. Close the game normally (Quit from the main menu) and it is
+    mods\StarMP\crash logs\<your name> with the last ~45 seconds. Close the game normally (Quit from the main menu) and it is
     deleted. If the game crashes, freezes or is force-closed it stays, with the end of starsector.log added - send
     it to the mod author.
-  - F9: saves "StarMP bug report - <name> - <time>.txt" (last 60 seconds) to mods\StarMP\player logs\<your name>. When
+  - F9: saves "StarMP bug report - <name> - <time>.txt" (last 6 minutes) to mods\StarMP\player logs\<your name>. When
     something looks wrong, have everyone nearby press F9 at about the same time. F10: performance overlay on/off.
   - What's in them: your player name, the time and time zone, the mod version and your mod list; what YOUR screen
     shows - your fleet, other players' fleets and NPC fleets (positions, speeds, states), and in battles every

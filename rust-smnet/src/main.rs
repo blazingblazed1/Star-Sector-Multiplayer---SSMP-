@@ -351,6 +351,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut ping = tokio::time::interval(PING_EVERY);
+    let mut stat = tokio::time::interval(Duration::from_secs(1)); // 0.1.14: connection numbers once a second, independent of the pings (which queue behind battle data)
     let mut last_rx = Instant::now();
     let mut save_bytes: u64 = 0;
     // read_frame is not cancel-safe (a half-read frame would be lost if another select! branch fired),
@@ -382,13 +383,16 @@ where
                                     let ms = now_ms().saturating_sub(ts);
                                     // which network path the link uses right now (debug log / F10 overlay)
                                     let mut path = "none"; let mut qrtt = 0u64;
+                                    // 0.1.13: packets lost / sent on this connection so far (the F9 report turns it into a loss rate)
+                                    let (mut lost, mut sent) = (0u64, 0u64);
+                                    if let Some(c) = &conn { let st = c.stats(); lost = st.lost_packets; sent = st.udp_tx.datagrams; }
                                     match &conn {
                                         Some(conn) => { for p in conn.paths().iter() {
                                             if p.is_selected() { path = if p.is_relay() { "relay" } else if p.is_ip() { "direct" } else { "other" }; qrtt = p.rtt().as_millis() as u64; }
                                         } }
                                         None => { path = "direct"; } // LAN (plain TCP)
                                     }
-                                    let _ = out.send(json!({"ev":"latency","peer":peer,"ms":ms,"path":path,"qrtt":qrtt}));
+                                    let _ = out.send(json!({"ev":"latency","peer":peer,"ms":ms,"path":path,"qrtt":qrtt,"lost":lost,"sent":sent}));
                                 }
                             }
                             Some("msg") => {
@@ -421,6 +425,17 @@ where
                         }
                     }
                     None => break "closed locally".to_string(),
+                }
+            }
+            _ = stat.tick() => {
+                if let Some(c) = &conn {
+                    let st = c.stats();
+                    let mut path = "none"; let mut qrtt = 0u64;
+                    for p in c.paths().iter() {
+                        if p.is_selected() { path = if p.is_relay() { "relay" } else if p.is_ip() { "direct" } else { "other" }; qrtt = p.rtt().as_millis() as u64; }
+                    }
+                    let _ = out.send(json!({"ev":"netstat","peer":peer,"path":path,"qrtt":qrtt,"lost":st.lost_packets,"lost_bytes":st.lost_bytes,
+                        "sent":st.udp_tx.datagrams,"recv":st.udp_rx.datagrams,"sent_bytes":st.udp_tx.bytes,"recv_bytes":st.udp_rx.bytes}));
                 }
             }
             _ = ping.tick() => {

@@ -77,6 +77,7 @@ public final class Perf {
         end("Diag", t0);
     }
 
+    private static final Map<Integer, long[]> prevNet = new HashMap<>();
     private static String f1(double v) { return String.format(Locale.ROOT, "%.1f", v); }
 
     private static void emit(float secs) {
@@ -141,6 +142,8 @@ public final class Perf {
             if (p == null) continue;
             if (peers.length() > 0) peers.append(", ");
             peers.append(p.name).append(' ').append(p.pingMs).append("ms ").append(p.path);
+            if (p.quicRttMs >= 0) peers.append(" path-rtt ").append(p.quicRttMs).append("ms"); // 0.9.4.4: the network path's own round trip (the first number is the in-stream ping)
+            if (p.lostPackets >= 0 && p.sentPackets > 0) peers.append(" lost ").append(p.lostPackets).append('/').append(p.sentPackets).append(" pkts (").append(f1(100.0 * p.lostPackets / p.sentPackets)).append("%)");
         }
 
         String line = "ctx=" + ctx + " fps=" + f1(fps) + " frame avg=" + f1(avg) + " p95=" + f1(p95) + " p99=" + f1(p99) + " worst=" + f1(worst) + " hitches>100ms=" + hitches
@@ -151,6 +154,18 @@ public final class Perf {
                 + (peers.length() > 0 ? " | peers " + peers : "")
                 + (counts.isEmpty() ? "" : " | " + counts);
         Diag.line("PERF", line);
+        // 0.9.4.4: one NET line per peer per second - the in-stream ping (grows when battle data is queued), the network path's own
+        // round trip, and the packets sent / received / lost on the connection in the last second and in total
+        if (net != null) for (Integer id : net.peerIds()) {
+            NetManager.Peer p = net.peer(id);
+            if (p == null || p.sentPackets < 0) continue;
+            long[] pv = prevNet.computeIfAbsent(id, k -> new long[]{p.sentPackets, p.recvPackets, p.lostPackets, p.sentBytes, p.recvBytes});
+            long dS = p.sentPackets - pv[0], dR = p.recvPackets - pv[1], dL = p.lostPackets - pv[2], dSB = p.sentBytes - pv[3], dRB = p.recvBytes - pv[4];
+            pv[0] = p.sentPackets; pv[1] = p.recvPackets; pv[2] = p.lostPackets; pv[3] = p.sentBytes; pv[4] = p.recvBytes;
+            Diag.line("NET", "peer=" + p.name + " in-stream-ping=" + p.pingMs + "ms path-rtt=" + p.quicRttMs + "ms path=" + p.path
+                + " | last second: sent " + dS + " pkts (" + f1(dSB / 1024.0) + " KB), received " + dR + " pkts (" + f1(dRB / 1024.0) + " KB), lost " + dL + " of sent (" + (dS > 0 ? f1(100.0 * dL / dS) : "0.0") + "%)"
+                + " | total: sent " + p.sentPackets + ", received " + p.recvPackets + ", lost " + p.lostPackets + " (" + (p.sentPackets > 0 ? f1(100.0 * p.lostPackets / p.sentPackets) : "0.0") + "%)");
+        }
 
         // overlay
         List<String> ov = new ArrayList<>();

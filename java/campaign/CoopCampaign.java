@@ -121,6 +121,7 @@ public class CoopCampaign implements EveryFrameScript {
         try { Scoreboard.register(); } catch (Throwable t) { StarMPPlugin.flog("scoreboard: " + t); }
         try { ChatHooks.register(); } catch (Throwable t) { StarMPPlugin.flog("chat: " + t); }
         try { DiagInput.register(); } catch (Throwable t) { StarMPPlugin.flog("diag input: " + t); }
+        try { ColonySync.install(); } catch (Throwable t) { StarMPPlugin.flog("colony sync install: " + t); }
         try { MarketSync.install(); } catch (Throwable t) { StarMPPlugin.flog("market sync install: " + t); }
         try { LootSplit.register(); } catch (Throwable t) { StarMPPlugin.flog("loot split: " + t); }
         try { Global.getSector().getListenerManager().removeListenerOfClass(FriendHud.class); Global.getSector().getListenerManager().addListener(new FriendHud(), true); }
@@ -300,6 +301,7 @@ public class CoopCampaign implements EveryFrameScript {
         try { TimeLock.tick(client); } catch (Throwable t) { StarMPPlugin.flog("time lock error: " + t); }
         try { RepShare.tick(net, sector); } catch (Throwable t) { StarMPPlugin.flog("rep share error: " + StarMPPlugin.trace(t)); }
         pt = starmp.diag.Perf.begin();
+        try { ColonySync.tick(); } catch (Throwable t) { StarMPPlugin.flog("colony sync error: " + StarMPPlugin.trace(t)); }
         try { MarketSync.tick(net, sector, hosting, client); } catch (Throwable t) { StarMPPlugin.flog("market sync error: " + StarMPPlugin.trace(t)); }
         starmp.diag.Perf.end("Sub:Markets", pt);
         if (hosting) { try { AutoSave.hostTick(net, sector); } catch (Throwable t) { StarMPPlugin.flog("autosave error: " + t); } }

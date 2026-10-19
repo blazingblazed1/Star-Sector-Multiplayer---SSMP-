@@ -155,6 +155,8 @@ public final class CoopState {
             starmp.Session.onPacket(peer, data);
         } else if (t >= starmp.campaign.Alliances.ALLY && t <= starmp.campaign.Alliances.ALLYSET) { // 0.9.2.2
             starmp.campaign.Alliances.onPacket(net, peer, data);
+        } else if (t == starmp.campaign.ColonySync.COL) { // 0.9.4.2
+            starmp.campaign.ColonySync.onPacket(net, peer, data);
         } else if (t == starmp.campaign.Pvp.PVP) { // 0.9.2.5
             starmp.campaign.Pvp.onPacket(net, peer, data);
         } else if (t == starmp.campaign.AllianceStorage.STORE || t == starmp.campaign.AllianceStorage.STORED) { // 0.9.2.4

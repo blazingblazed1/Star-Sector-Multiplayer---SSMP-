@@ -23,6 +23,11 @@ import starmp.StarMPPlugin;
  */
 public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
     private static final float SNAPSHOT_INTERVAL = 0.05f, INPUT_INTERVAL = 0.033f;
+    /** 0.9.4.4: snapshot spacing per link level (0 healthy, 1 backing up, 2 badly backed up), chosen from the connection's round trip. */
+    private static final float[] LEVEL_INTERVAL = {0.05f, 0.10f, 0.20f};
+    private int linkLevel; private long linkCheckNs, linkLowSinceNs;
+    private final Set<Integer> defsSent = new HashSet<>();
+    private String defsPeers = ""; private int defLogs;
     private static final String MIRROR = "starmp_mirror";
 
     private CombatEngineAPI engine;
@@ -269,6 +274,7 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
             RemoteShipAI ai = new RemoteShipAI(pick);
             pick.setShipAI(ai);
             assigned.put(p, pick); ais.put(p, ai);
+            Integer pickId = ids.get(pick); if (pickId != null) defsSent.remove(pickId); // 0.9.4.4: its owner changed, send its definition again
             StarMPPlugin.flog("assigned " + pick.getHullSpec().getHullId() + " (" + pick.getName() + ", id " + ids.get(pick) + ") to peer " + p);
             engine.addFloatingText(pick.getLocation(), "Player " + p, 24f, java.awt.Color.CYAN, pick, 1f, 3f);
         }
@@ -293,18 +299,29 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
             if (over && !battleEndSent) { battleEndSent = true; sendResults(net); sendBattle(net, false); StarMPPlugin.flog("combat: campaign battle over, told clients"); }
             else if (!over && nowNs - lastBattleNs > 1_000_000_000L) { lastBattleNs = nowNs; sendBattle(net, true); }
         }
-        // ship definitions: whenever new ships appeared, and every 3 s for late joiners
-        if (ids.size() != defsSentCount || nowNs - lastDefsNs > 3_000_000_000L) {
-            defsSentCount = ids.size(); lastDefsNs = nowNs;
-            List<Wire.ShipDef> defList = buildDefs(net);
-            net.sendAll(Wire.encodeDefs(defList));
+        // 0.9.4.4: ship definitions. They used to be sent in full every time the ship count changed (fighters and wrecks
+        // come and go constantly) and every 3 s - over half of all battle traffic in a 130-ship fight, which choked the
+        // link. Now only ships the peers haven't been sent go out; the whole list repeats when the set of peers changes
+        // (a new joiner) and every 5 s for players who open the battle later. Clients only ever add to their list, so old builds still work.
+        updateLinkLevel(net, nowNs);
+        String peerKey = net.peerIds() + "|" + CoopState.joinFleets.keySet(); // a player bringing ships into the battle counts as a new peer
+        boolean fullDefs = !peerKey.equals(defsPeers) || nowNs - lastDefsNs > 5_000_000_000L;
+        Set<Integer> onlyIds = null;
+        if (!fullDefs) {
+            for (Integer id : ids.values()) if (!defsSent.contains(id)) { if (onlyIds == null) onlyIds = new HashSet<>(); onlyIds.add(id); }
+        }
+        if (fullDefs || onlyIds != null) {
+            if (fullDefs) { defsPeers = peerKey; lastDefsNs = nowNs; }
+            List<Wire.ShipDef> defList = buildDefs(net, fullDefs ? null : onlyIds);
+            for (Wire.ShipDef d : defList) defsSent.add(d.id);
+            if (!defList.isEmpty()) { byte[] dp = Wire.encodeDefs(defList); net.sendAll(dp); if (defLogs++ < 40) StarMPPlugin.flog("combat: ship definitions sent: " + defList.size() + (fullDefs ? " (full list, " : " (new ships only, ") + dp.length + " bytes), " + defsSent.size() + " known"); }
             Map<Integer, String> names = new TreeMap<>();
             for (Wire.ShipDef d : defList) if (d.player >= 0 && !names.containsKey(d.player)) names.put(d.player, CoopState.nameOf(net, d.player));
             if (!names.isEmpty()) net.sendAll(Wire.encodeNames(names));
         }
         if (diagDue()) hostDiag();
         // snapshots + projectiles on the wall clock (keep flowing while paused)
-        if (nowNs - lastSnapNs < (long) (SNAPSHOT_INTERVAL * 1e9)) return;
+        if (nowNs - lastSnapNs < (long) (LEVEL_INTERVAL[linkLevel] * 1e9)) return;
         lastSnapNs = nowNs;
         Wire.Snapshot snap = new Wire.Snapshot();
         snap.tick = ++tick;
@@ -352,8 +369,7 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
             if (id != null) snap.assignments.put(a.getKey(), id);
         }
         net.sendAll(Wire.encodeSnapshot(snap));
-        for (ShipAPI dead : prune) { Integer id = ids.remove(dead); if (id != null) byId.remove(id); deadReports.remove(dead); }
-        if (!prune.isEmpty()) defsSentCount = -1; // resend defs without them
+        for (ShipAPI dead : prune) { Integer id = ids.remove(dead); if (id != null) { byId.remove(id); defsSent.remove(id); } deadReports.remove(dead); }
         prune.clear();
         // projectiles that appeared since the last snapshot
         List<Wire.ProjSpawn> spawns = new ArrayList<>();
@@ -729,9 +745,35 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
     private final List<ShipAPI> prune = new ArrayList<>();
     private final Map<Object, Integer> wingKeys = new IdentityHashMap<>();
 
-    private List<Wire.ShipDef> buildDefs(NetManager net) {
+    private long pingBaseline = Long.MAX_VALUE;
+
+    /** 0.9.4.4: how backed up the slowest peer's link is. The helper pings each peer through the same in-order stream the
+     *  battle data uses, so that ping grows when data is queued (in Toasty's 130-ship fight it reached 7-11 s and the
+     *  other player ended up minutes behind). Worse links get fewer snapshots so the queue drains instead of growing.
+     *  Measured against the quietest ping seen in this battle so a naturally slow link (relay, far away) isn't treated as
+     *  backed up. Steps up at once, steps back down only after 4 s of clearly better pings. */
+    private void updateLinkLevel(NetManager net, long nowNs) {
+        if (nowNs - linkCheckNs < 500_000_000L) return;
+        linkCheckNs = nowNs;
+        long worst = 0;
+        try { for (Integer p : net.peerIds()) { NetManager.Peer pr = net.peer(p); if (pr != null && pr.pingMs > 0) worst = Math.max(worst, (long) pr.pingMs); } } catch (Throwable ignored) {}
+        if (worst <= 0) return;
+        pingBaseline = Math.min(pingBaseline, worst);
+        long excess = worst - pingBaseline;
+        int want = excess > 2000 ? 2 : excess > 700 ? 1 : 0;
+        int calm = excess > 1000 ? 2 : excess > 350 ? 1 : 0; // what the link would allow if it were healthy
+        if (want > linkLevel) { linkLevel = want; linkLowSinceNs = 0; StarMPPlugin.flog("combat: link backing up (ping " + worst + " ms, " + excess + " over its best) -> snapshots every " + Math.round(LEVEL_INTERVAL[linkLevel] * 1000) + " ms"); }
+        else if (calm < linkLevel) {
+            if (linkLowSinceNs == 0) linkLowSinceNs = nowNs;
+            else if (nowNs - linkLowSinceNs > 4_000_000_000L) { linkLevel--; linkLowSinceNs = 0; StarMPPlugin.flog("combat: link recovering (ping " + worst + " ms) -> snapshots every " + Math.round(LEVEL_INTERVAL[linkLevel] * 1000) + " ms"); }
+        } else linkLowSinceNs = 0;
+    }
+
+    /** only = null: every ship; otherwise just those ids (0.9.4.4: ships the peers haven't been sent). */
+    private List<Wire.ShipDef> buildDefs(NetManager net, Set<Integer> only) {
         List<Wire.ShipDef> out = new ArrayList<>();
         for (Map.Entry<ShipAPI, Integer> e : ids.entrySet()) {
+            if (only != null && !only.contains(e.getValue())) continue;
             ShipAPI s = e.getKey();
             if (s.isFighter()) { // fighters: wing type + which wing, the joiner spawns matching wings
                 Wire.ShipDef d = new Wire.ShipDef();
@@ -1424,11 +1466,21 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
                 }
                 if (t != null) { me.setShipTarget(t); StarMPPlugin.flog("client: TEST locked target " + t.getHullSpec().getHullId() + " (id " + mirrorId.get(t) + ")"); }
             }
+            // 0.9.4.4: F9 line whenever the lock changes (what the player sees: which ship, its hull and flux as shown on this screen)
+            if (t != lastLoggedTarget) {
+                lastLoggedTarget = t;
+                try {
+                    starmp.diag.Diag.line("TARGET", "t=" + String.format(java.util.Locale.ROOT, "%.2f", engine.getTotalElapsedTime(false))
+                        + (t == null ? " none" : " id=" + mirrorId.get(t) + " hull=" + t.getHullSpec().getHullId() + " hp=" + String.format(java.util.Locale.ROOT, "%.3f", t.getHullLevel())
+                            + " flux=" + String.format(java.util.Locale.ROOT, "%.2f", t.getFluxLevel()) + " alive=" + (t.isAlive() ? 1 : 0) + " ally=" + (t.isAlly() ? 1 : 0)));
+                } catch (Throwable ignored) {}
+            }
             if (t == null) return 0;
             Integer id = mirrorId.get(t);
             return id == null ? 0 : id;
         } catch (Throwable ignored) { return 0; }
     }
+    private ShipAPI lastLoggedTarget;
 
     /** 0.9.0.0: the owner of a battle without pause permission (a guest's own battle) can't pause it either. Runs
      *  before the game reads the keys, so consuming the key stops the pause. */

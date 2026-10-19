@@ -2,13 +2,13 @@
 //!
 //! WHAT THIS DOES, in plain words (for anyone reading the source):
 //!  - The game sends us its own debug lines (fleet positions, combat, performance) over the same pipe it already
-//!    uses. We keep the last 60 seconds of them in memory.
+//!    uses. We keep the last 6 minutes of them in memory.
 //!  - While the game runs, a file "StarMP crash report - DO NOT DELETE - ..." in StarMP/crash logs holds the last
 //!    30+ seconds. New lines are appended every 250 ms; every 15 s the file is rewritten to drop older lines.
 //!  - When the game is closed normally it tells us so ("diag_clean") and the file is deleted. If the game crashes,
 //!    freezes or is force-closed, the file stays and gets the end of starsector.log appended (Starsector's own error
 //!    message), with the Windows/Linux user name removed from file paths.
-//!  - F9 in the game ("diag_clip") writes "StarMP bug report - ..." with the last 60 seconds to StarMP/player logs.
+//!  - F9 in the game ("diag_clip") writes "StarMP bug report - ..." with the last 6 minutes to StarMP/player logs.
 //!  - Nothing here sends anything over the network. Files are only written to those two folders in the mod's own
 //!    folder (or the desktop if the player picks that in F8), and only these two kinds of file.
 //!
@@ -31,7 +31,7 @@ pub enum DiagMsg {
     HwHeader(String),
     /// One or more finished log lines ("\n" separated).
     Lines(String),
-    /// F9: write the last 60 s to a bug report file.
+    /// F9: write the last 6 min to a bug report file.
     Clip(std::sync::mpsc::Sender<String>),
     /// The game is closing normally: delete the crash report when it ends.
     Clean,
@@ -39,8 +39,8 @@ pub enum DiagMsg {
     Finish,
 }
 
-const KEEP: Duration = Duration::from_secs(60);
-const CRASH_KEEP: Duration = Duration::from_secs(30);
+const KEEP: Duration = Duration::from_secs(360);
+const CRASH_KEEP: Duration = Duration::from_secs(45);
 const FLUSH_EVERY: Duration = Duration::from_millis(250);
 const COMPACT_EVERY: Duration = Duration::from_secs(15);
 const FREEZE_AFTER: Duration = Duration::from_secs(10);
@@ -197,7 +197,7 @@ impl State {
     fn clip(&self) -> String {
         let Some(dir) = self.dir("player logs").or_else(|| self.player_dir("player logs")) else { return "error: no folder for bug reports".into() };
         let p = dir.join(format!("StarMP bug report - {}.txt", self.name_stamp(now_ms())));
-        let text = format!("{}{}", self.header("bug report (F9, last 60 seconds)"), self.lines_since(KEEP));
+        let text = format!("{}{}", self.header("bug report (F9, last 6 minutes)"), self.lines_since(KEEP));
         match std::fs::write(&p, text) {
             Ok(_) => p.display().to_string(),
             Err(e) => format!("error: {e}"),

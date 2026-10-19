@@ -24,7 +24,7 @@ public final class NetManager {
     public static final class Peer {
         public final int id; public final String name; public volatile int pingMs = -1;
         /** 0.1.5.3: which network path the link uses ("direct", "relay") and QUIC's own round-trip estimate. */
-        public volatile String path = "?"; public volatile int quicRttMs = -1;
+        public volatile String path = "?"; public volatile int quicRttMs = -1; public volatile long lostPackets = -1, sentPackets = -1, recvPackets = -1, lostBytes = -1, sentBytes = -1, recvBytes = -1;
         Peer(int id, String name) { this.id = id; this.name = name; }
     }
 
@@ -140,6 +140,7 @@ public final class NetManager {
         } catch (IOException ignored) {}
     }
 
+    private static long lng(Object o) { return o instanceof Number ? ((Number) o).longValue() : -1; }
     private static int num(Object o) { return o instanceof Number ? ((Number) o).intValue() : -1; }
 
     private void handle(Map<String, Object> e) {
@@ -170,12 +171,23 @@ public final class NetManager {
                 firePeers();
                 break;
             }
+            case "netstat": { // 0.9.4.4: connection numbers once a second from the helper (packets sent / received / lost, path round trip)
+                Peer pr = peers.get(num(e.get("peer")));
+                if (pr != null) {
+                    if (e.get("path") != null) pr.path = String.valueOf(e.get("path"));
+                    if (e.get("qrtt") != null) pr.quicRttMs = num(e.get("qrtt"));
+                    pr.lostPackets = lng(e.get("lost")); pr.sentPackets = lng(e.get("sent")); pr.recvPackets = lng(e.get("recv"));
+                    pr.lostBytes = lng(e.get("lost_bytes")); pr.sentBytes = lng(e.get("sent_bytes")); pr.recvBytes = lng(e.get("recv_bytes"));
+                }
+                break;
+            }
             case "latency": {
                 Peer pr = peers.get(num(e.get("peer")));
                 if (pr != null) {
                     pr.pingMs = num(e.get("ms"));
                     if (e.get("path") != null) pr.path = String.valueOf(e.get("path"));
                     if (e.get("qrtt") != null) pr.quicRttMs = num(e.get("qrtt"));
+                    if (e.get("lost") != null) { pr.lostPackets = ((Number) e.get("lost")).longValue(); pr.sentPackets = e.get("sent") == null ? -1 : ((Number) e.get("sent")).longValue(); }
                     firePeers();
                 }
                 break;
@@ -258,7 +270,7 @@ public final class NetManager {
         synchronized (peers) {
             Peer old = peers.get(id);
             if (old == null) return;
-            Peer p = new Peer(id, name); p.pingMs = old.pingMs; p.path = old.path; p.quicRttMs = old.quicRttMs;
+            Peer p = new Peer(id, name); p.pingMs = old.pingMs; p.path = old.path; p.quicRttMs = old.quicRttMs; p.lostPackets = old.lostPackets; p.sentPackets = old.sentPackets; p.recvPackets = old.recvPackets; p.lostBytes = old.lostBytes; p.sentBytes = old.sentBytes; p.recvBytes = old.recvBytes;
             peers.put(id, p);
         }
     }

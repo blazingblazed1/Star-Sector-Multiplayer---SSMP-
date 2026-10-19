@@ -11,7 +11,7 @@ import starmp.StarMPPlugin;
 
 /**
  * 0.1.5.3 debug log. Collects this game's debug lines (campaign, combat, performance), stamps them with the player
- * name and UTC time, and hands them to the network helper every 250 ms. The helper keeps the last 60 s, maintains the
+ * name and UTC time, and hands them to the network helper every 250 ms. The helper keeps the last 6 min, maintains the
  * desktop crash report and writes F9 bug reports (see smnet/src/diag.rs). Nothing here sends logs over the network:
  * the only network use is a tiny clock-sync ping to the host (TSYNC) so logs from different PCs line up.
  *
@@ -267,7 +267,7 @@ public final class Diag {
         synchronized (buf) { if (buf.length() > 0) { text = buf.toString(); buf.setLength(0); } }
         if (text != null) n.diagCmd("cmd", "diag", "d", text);
         n.diagCmd("cmd", "diag_clip");
-        note("StarMP: saving bug report (last 60 s)...");
+        note("StarMP: saving bug report (last 6 min)...");
     }
 
     /** A message for the player, shown by whichever screen is up (campaign, combat or title). */

@@ -14,7 +14,7 @@ import java.util.Date;
  */
 public class StarMPPlugin extends BaseModPlugin {
     public static final String MOD_ID = "starmp";
-    public static final String VERSION = "0.9.4.1";
+    public static final String VERSION = "0.9.4.4";
     private static NetManager net;
     private static final StringBuilder logBuf = new StringBuilder();
     private static volatile boolean logDirty;
