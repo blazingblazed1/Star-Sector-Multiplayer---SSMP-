@@ -22,7 +22,7 @@ import starmp.StarMPPlugin;
  * Drawn by a combat plugin because the title screen runs a background battle.
  */
 public class TitleMenu extends BaseEveryFrameCombatPlugin {
-    enum Page { MAIN, SINGLE, TUTORIALS, OPTIONS, MULTI, JOIN, STARTED }
+    enum Page { MAIN, SINGLE, TUTORIALS, OPTIONS, MULTI, JOIN, STARTED, HOSTSET }
 
     private static Page page = Page.MAIN;
     private static String focus = null;
@@ -75,6 +75,9 @@ public class TitleMenu extends BaseEveryFrameCombatPlugin {
         if (!replaced && replaceTries < 120) { replaceTries++; replaced = Vanilla.replaceMainMenu(); }
         if (replaced) Vanilla.keepHidden();
         Lobby.tick(net());
+        starmp.Bot.titleTick(net()); // 0.1.6.5: no-op unless STARMP_BOT=1
+        starmp.Session.tick(net()); // 0.9.0.0 host settings / kicks / player limit
+        if (starmp.Session.kickedNotice != null) { notice = starmp.Session.kickedNotice; starmp.Session.kickedNotice = null; page = Page.MULTI; }
         if (Lobby.startedWhat != null && !net().isHost() && page != Page.STARTED && linked() && Lobby.startId != Lobby.dismissedStartId) page = Page.STARTED;
         boolean busy = vanillaBusy();
         float scale = Global.getSettings().getScreenScaleMult();
@@ -146,6 +149,7 @@ public class TitleMenu extends BaseEveryFrameCombatPlugin {
         String pa = pendingAction;
         if (pa != null) { pendingAction = null; StarMPPlugin.flog("menu: running " + pa + " from render"); vanilla(pa); return; }
         if (!active || net() == null) return;
+        if (starmp.Bot.titleRender(net())) return; // 0.1.6.5 bot test mode: loading the host's save
         starmp.diag.Diag.captureGl();
         starmp.diag.Overlay.draw(); // F10
         gui.begin();
@@ -178,6 +182,7 @@ public class TitleMenu extends BaseEveryFrameCombatPlugin {
             case MULTI: drawMulti(H); break;
             case JOIN: drawJoin(H); break;
             case STARTED: drawStarted(H); break;
+            case HOSTSET: drawHostSettings(H); break;
         }
         gui.text("StarMP " + StarMPPlugin.VERSION, Gui.TINY, 14, 24, Gui.B_DIM);
         if (Vanilla.problem != null) gui.text("Could not hide the game's menu (please send a screenshot): " + Vanilla.problem, Gui.TINY, 14, 44, Gui.BAD);
@@ -201,11 +206,15 @@ public class TitleMenu extends BaseEveryFrameCombatPlugin {
         if (withBack) gui.vbutton("back", "Back", px + 16, y - 11, bw, bh, true, this::back, true);
     }
 
+    /** 0.9.0.1: a height on the screen, kept below the Starsector logo. The logo sits a fixed distance above the
+     *  screen centre, so on tall screens a plain fraction of the height ran into it (same as before at 800 high). */
+    private static float under(float H, float f) { return Math.min(H * f, H / 2f + f * 800f - 400f); }
+
     private void heading(String text, float y) { gui.textCentered(text, Gui.BIG, cx(), y, Gui.B_TEXT); }
 
     private void drawOptions(float H) {
         NetManager n = net();
-        float pw = 560, ph = 460, px = cx() - pw / 2f, py = H * 0.66f - ph;
+        float pw = 560, ph = 460, px = cx() - pw / 2f, py = under(H, 0.66f) - ph;
         Gui.bpanel(px, py, pw, ph);
         float x = px + 30, w = pw - 60, top = py + ph - 24;
         heading("OPTIONS", top);
@@ -223,7 +232,7 @@ public class TitleMenu extends BaseEveryFrameCombatPlugin {
         gui.bbutton("savename", "SAVE", x + w - 120, y, 120, 32, true, TitleMenu::saveName);
         y -= 50;
         boolean lan = Prefs.getBool("lan", false);
-        gui.bbutton("lan", (lan ? "[x]" : "[  ]") + "  LAN / direct only (no internet relays)", x, y, w, 30, true, () -> Prefs.put("lan", String.valueOf(!Prefs.getBool("lan", false))));
+        gui.bbutton("lan", (lan ? "[x]" : "[  ]") + "  LAN mode (local network only, no Iroh)", x, y, w, 30, true, () -> Prefs.put("lan", String.valueOf(!Prefs.getBool("lan", false))));
         y -= 40;
         float ly = starmp.campaign.FriendHud.rangeLy();
         gui.bbutton("frange", "Friend markers in hyperspace: " + (ly <= 0 ? "off" : (ly == (int) ly ? String.valueOf((int) ly) : String.valueOf(ly)) + " light-years"), x, y, w, 30, true, () -> {
@@ -252,7 +261,7 @@ public class TitleMenu extends BaseEveryFrameCombatPlugin {
 
     private void drawMulti(float H) {
         NetManager n = net();
-        float top0 = H * 0.72f; // below the Starsector logo
+        float top0 = under(H, 0.72f); // below the Starsector logo
         heading("MULTIPLAYER", top0);
         // name strip (Brotato: "Your name" + salmon box)
         String nm = nameEdit == null ? n.playerName() : nameEdit;
@@ -262,24 +271,27 @@ public class TitleMenu extends BaseEveryFrameCombatPlugin {
         float pw = 560, ph = 330, px = cx() - pw / 2f, py = top0 - 90 - ph;
         Gui.bpanel(px, py, pw, ph);
         float x = px + 26, w = pw - 52, top = py + ph - 22;
-        heading("IROH", top);
-        String d1 = "Direct peer-to-peer connection with low latency. No port forwarding,";
-        String d2 = "no VPN - share a join code with your friend. Also works on a LAN.";
+        boolean lanMode = Prefs.getBool("lan", false);
+        heading(lanMode ? "LAN" : "IROH", top);
+        String d1 = lanMode ? "Local network only (same Wi-Fi / router, or a VPN such as Hamachi)." : "Direct peer-to-peer connection with low latency. No port forwarding,";
+        String d2 = lanMode ? "Games on your network show up below by themselves. No internet, no join codes." : "no VPN - share a join code with your friend. Also works on a LAN.";
         gui.textCentered(d1, Gui.TINY, cx(), top - 44, Gui.B_DIM);
         boolean viaLauncher = starmp.diag.Diag.launcherOk();
         if (viaLauncher) gui.textCentered(d2, Gui.TINY, cx(), top - 60, Gui.B_DIM);
         else gui.textCentered(starmp.diag.Diag.NEED_LAUNCHER, Gui.TINY, cx(), top - 60, Gui.GOLD);
         float by = top - 122, bw = (w - 16) / 2f;
         boolean idle = n.state() == NetManager.State.IDLE;
-        gui.bbutton("host", "HOST GAME", x, by, bw, 44, idle && viaLauncher, () -> { saveNameIfEditing(); n.host(Prefs.getBool("lan", false)); });
-        gui.bbutton("join", "JOIN GAME", x + bw + 16, by, bw, 44, idle && viaLauncher, () -> { saveNameIfEditing(); page = Page.JOIN; String c = clipboard(); joinCode = c.startsWith("SM1:") ? c : ""; notice = null; });
-        boolean lan = Prefs.getBool("lan", false);
-        gui.bbutton("lan", (lan ? "[x]" : "[  ]") + "  LAN / direct only (no internet relays)", x, by - 36, w, 26, true,
+        gui.bbutton("host", "HOST GAME", x, by, bw, 44, idle && viaLauncher, () -> { saveNameIfEditing(); page = Page.HOSTSET; notice = null; StarMPPlugin.flog("menu: host settings"); }); // 0.9.0.0: settings first
+        gui.bbutton("join", "JOIN GAME", x + bw + 16, by, bw, 44, idle && viaLauncher, () -> { saveNameIfEditing(); page = Page.JOIN; String c = clipboard(); joinCode = lanMode ? "" : (c.startsWith("SM1:") ? c : ""); notice = null; });
+        gui.bbutton("lan", (lanMode ? "[x]" : "[  ]") + "  LAN mode (local network only, no Iroh)", x, by - 36, w, 26, true,
                 () -> Prefs.put("lan", String.valueOf(!Prefs.getBool("lan", false))));
-        gui.text("Public games", Gui.TINY, x, by - 52, Gui.B_TEXT);
+        gui.text(lanMode ? "Games on your network" : "Public games", Gui.TINY, x, by - 52, Gui.B_TEXT);
         float boxH = by - 66 - (py + 18);
         Gui.rect(x, py + 18, w, boxH, Gui.B_BOX);
-        gui.text("Iroh games are private: join with the host's code.", Gui.TINY, x + 10, py + 18 + boxH - 10, Gui.B_DIM);
+        if (lanMode) {
+            if (idle) n.lanScanIfDue();
+            drawLanList(n, x + 10, py + 18 + boxH - 34, w - 20, 26, Math.max(1, (int) ((boxH - 12) / 30)), idle && viaLauncher);
+        } else gui.text("Iroh games are private: join with the host's code.", Gui.TINY, x + 10, py + 18 + boxH - 10, Gui.B_DIM);
         String state = n.state() == NetManager.State.STARTING ? "Starting host..." : n.state() == NetManager.State.JOINING ? "Joining..." : null;
         if (state != null) gui.text(state, Gui.TINY, x + 10, py + 18 + boxH - 30, Gui.B_TEXT);
         gui.bbutton("back", "BACK", px, py - 48, 140, 34, true, this::back);
@@ -287,11 +299,72 @@ public class TitleMenu extends BaseEveryFrameCombatPlugin {
 
     private void saveNameIfEditing() { if (nameEdit != null) saveName(); focus = null; }
 
-    private void drawJoin(float H) {
+    /** 0.9.0.0: host settings before hosting (and from the lobby's SETTINGS button). Each row cycles its value. */
+    private static boolean hsErr;
+    private void drawHostSettings(float H) {
         NetManager n = net();
-        float pw = 560, ph = 250, px = cx() - pw / 2f, py = H * 0.62f - ph;
+        String[] rows = starmp.Session.HOST_ROWS;
+        // 0.9.3.1: tighter rows once the list is long (the PvP rows pushed the panel over the logo at 1280x800)
+        float rowStep = rows.length > 10 ? 24 : 30, rowH = rows.length > 10 ? 21 : 26;
+        float pw = 640, ph = 120 + rows.length * rowStep + 64, px = cx() - pw / 2f, py = Math.max(60, under(H, 0.70f) - ph);
         Gui.bpanel(px, py, pw, ph);
         float x = px + 26, w = pw - 52, top = py + ph - 22;
+        heading("HOST SETTINGS", top);
+        gui.textCentered("Click a row to change it. Players without a permission can start a vote (if votes are on).", Gui.TINY, cx(), top - 40, Gui.B_DIM);
+        float y = top - 92;
+        for (String k : rows) {
+            String label;
+            try { label = starmp.Session.rowLabel(k); } catch (Throwable t) { label = k; if (!hsErr) { hsErr = true; StarMPPlugin.flog("host settings row " + k + ": " + StarMPPlugin.trace(t)); } }
+            gui.bbutton("hs_" + k, label, x, y, w, rowH, true, () -> { try { starmp.Session.cycleRow(k); } catch (Throwable t) { StarMPPlugin.flog("host settings change " + k + ": " + StarMPPlugin.trace(t)); } });
+            y -= rowStep;
+        }
+        boolean hosting = n.isHost() && n.state() != NetManager.State.IDLE;
+        boolean lan = Prefs.getBool("lan", false);
+        gui.bbutton("lan", (lan ? "[x]" : "[  ]") + "  LAN mode (local network only, no Iroh)", x, y, w, 26, !hosting, () -> Prefs.put("lan", String.valueOf(!Prefs.getBool("lan", false))));
+        gui.bbutton("go", hosting ? "BACK TO LOBBY" : "START HOSTING", x + w - 220, py + 16, 220, 38, true, () -> {
+            page = Page.MULTI; // first, so a problem below can't leave the player stuck here
+            if (!hosting) {
+                StarMPPlugin.flog("menu: start hosting (lan " + Prefs.getBool("lan", false) + ", state " + n.state() + ")");
+                try { starmp.Session.clearKicks(); } catch (Throwable t) { StarMPPlugin.flog("clear kicks: " + t); }
+                n.host(Prefs.getBool("lan", false));
+            } });
+        gui.bbutton("back", "BACK", px, py - 48, 140, 34, true, () -> page = Page.MULTI);
+    }
+
+    /** 0.9.4.0: clickable list of games found on the local network. */
+    private void drawLanList(NetManager n, float x, float y, float w, float rowH, int maxRows, boolean enabled) {
+        java.util.List<String[]> hs = n.lanHosts;
+        String st = n.state() == NetManager.State.STARTING ? "Starting host..." : n.state() == NetManager.State.JOINING ? "Joining..." : null;
+        if (st != null) { gui.text(st, Gui.TINY, x, y + 18, Gui.B_TEXT); return; }
+        if (hs.isEmpty()) { gui.text("Looking for games on your network...  (none found yet)", Gui.TINY, x, y + 18, Gui.B_DIM); return; }
+        for (int i = 0; i < hs.size() && i < maxRows; i++) {
+            final String[] h = hs.get(i);
+            final String addr = h[1];
+            gui.bbutton("lanhost" + i, h[0] + "   -   " + addr + "   (" + h[2] + " player" + ("1".equals(h[2]) ? "" : "s") + ")", x, y - i * (rowH + 4), w, rowH, enabled,
+                    () -> { saveNameIfEditing(); StarMPPlugin.flog("menu: join LAN game " + addr); n.joinLan(addr); });
+        }
+    }
+
+    private void drawJoin(float H) {
+        NetManager n = net();
+        boolean lanMode = Prefs.getBool("lan", false);
+        float pw = 560, ph = lanMode ? 330 : 250, px = cx() - pw / 2f, py = under(H, 0.62f) - ph;
+        Gui.bpanel(px, py, pw, ph);
+        float x = px + 26, w = pw - 52, top = py + ph - 22;
+        if (lanMode) {
+            heading("JOIN LAN GAME", top);
+            gui.text("Click a game found on your network:", Gui.TINY, x, top - 46, Gui.B_DIM);
+            if (n.state() == NetManager.State.IDLE) n.lanScanIfDue();
+            drawLanList(n, x, top - 92, w, 26, 4, n.state() == NetManager.State.IDLE);
+            float fy = py + 100;
+            gui.text("Not listed? Type the host's address (like 25.1.2.3 or 192.168.1.5):", Gui.TINY, x, fy + 46, Gui.B_DIM);
+            gui.bfield("join", joinCode, "host address", x, fy, w - 110, 32, "join".equals(focus), null, () -> focus = "join");
+            boolean ok = !joinCode.trim().isEmpty();
+            gui.bbutton("dojoin", n.state() == NetManager.State.JOINING ? "CONNECTING..." : "JOIN", x + w - 100, fy, 100, 32, ok && n.state() == NetManager.State.IDLE, () -> { saveNameIfEditing(); n.joinLan(joinCode); });
+            synchronized (log) { if (!log.isEmpty() && log.getLast().startsWith("ERROR")) gui.text(log.getLast(), Gui.TINY, x, py + 64, Gui.GOOD); }
+            gui.bbutton("back", "BACK", x, py + 16, 120, 30, true, this::back);
+            return;
+        }
         heading("JOIN IROH GAME", top);
         gui.text("Copy the host's join code, then press PASTE.", Gui.TINY, x, top - 46, Gui.B_DIM);
         float fy = top - 96;
@@ -307,16 +380,19 @@ public class TitleMenu extends BaseEveryFrameCombatPlugin {
 
     private void drawLobby(float H) {
         NetManager n = net();
-        float pw = 680, ph = 470, px = cx() - pw / 2f, py = H * 0.68f - ph;
+        float pw = 680, ph = 470, px = cx() - pw / 2f, py = under(H, 0.68f) - ph;
         Gui.bpanel(px, py, pw, ph);
         float x = px + 26, w = pw - 52, top = py + ph - 22;
-        heading(n.isHost() ? "YOUR LOBBY  (IROH)" : "LOBBY  (IROH)", top);
+        String tag = Prefs.getBool("lan", false) ? "LAN" : "IROH";
+        heading(n.isHost() ? "YOUR LOBBY  (" + tag + ")" : "LOBBY  (" + tag + ")", top);
         float y = top - 48;
         if (n.isHost()) {
-            gui.text("Join code - send this to your friend:", Gui.TINY, x, y, Gui.B_DIM);
+            boolean lanHost = n.code().startsWith("LAN:");
+            gui.text(lanHost ? "Your address - players on your network find this game automatically (or type it in):" : "Join code - send this to your friend:", Gui.TINY, x, y, Gui.B_DIM);
             y -= 50;
-            gui.bfield("code", n.code().isEmpty() ? "" : n.code(), "starting...", x, y, w - 110, 26, false, null, null);
-            gui.bbutton("copy", "COPY", x + w - 100, y, 100, 26, !n.code().isEmpty(), () -> copy(n.code()));
+            String shown = lanHost ? n.code().substring(4) : n.code();
+            gui.bfield("code", shown, "starting...", x, y, w - 110, 26, false, null, null);
+            gui.bbutton("copy", "COPY", x + w - 100, y, 100, 26, !n.code().isEmpty(), () -> copy(shown));
             y -= 22;
         }
         // everyone: direct links plus (for guests) the other guests the host tells us about
@@ -324,7 +400,10 @@ public class TitleMenu extends BaseEveryFrameCombatPlugin {
         ids.addAll(Lobby.members.keySet());
         ids.remove(n.myId());
         int count = 1 + ids.size();
-        gui.text("Players " + count + "/10", Gui.TINY, x, y - 6, Gui.B_TEXT);
+        starmp.Session.Settings ss = starmp.Session.current();
+        gui.text("Players " + count + "/" + ss.maxPlayers, Gui.TINY, x, y - 6, Gui.B_TEXT);
+        gui.text("Pause: " + starmp.Session.permLabel(ss.pausePerm) + (ss.votePause ? " (others vote)" : "") + "  -  Fast-forward: " + starmp.Session.permLabel(ss.speedPerm)
+                + "  -  Kick: " + starmp.Session.permLabel(ss.kickPerm), Gui.TINY, x + 110, y - 6, Gui.B_DIM);
         y -= 28;
         y = playerRow(x, y, w, n.playerName() + (n.isHost() ? "  (you, host)" : "  (you)"), Lobby.myReady, -1, StarMPPlugin.VERSION, false);
         for (Integer id : ids) {
@@ -336,6 +415,8 @@ public class TitleMenu extends BaseEveryFrameCombatPlugin {
             boolean mismatch = m != null && !m.version.isEmpty() && !m.version.equals(StarMPPlugin.VERSION);
             boolean modsDiffer = m != null && !m.mods.isEmpty() && !m.mods.equals(Lobby.modList());
             if (modsDiffer) { name = name + "  - DIFFERENT MODS"; mismatch = true; }
+            if (id != 0 && starmp.Session.isAdmin(p != null ? p.name : m.name)) name = name + "  (admin)";
+            if (id != 0 && starmp.Session.myCan(starmp.Session.Perm.KICK)) { final int kid = id; gui.bbutton("kick" + id, "KICK", x + w - 370, y - 17, 50, 18, true, () -> { starmp.Session.kick(kid); notice = "Kicked " + (p != null ? p.name : m.name) + "."; }); }
             y = playerRow(x, y, w, name, m != null && m.ready, p != null ? p.pingMs : -1, ver, mismatch);
         }
         if (count < 2) { gui.text("-  open slot", Gui.TINY, x + 6, y, Gui.B_DIM); y -= 20; }
@@ -349,13 +430,14 @@ public class TitleMenu extends BaseEveryFrameCombatPlugin {
             gui.text("SAVED CAMPAIGN: share your newest save.  NEW CAMPAIGN: make a new game, sent at the map.", Gui.TINY, x, py + 154, Gui.B_DIM);
             gui.text("START BATTLE: everyone starts any mission; your battle appears on their screens.", Gui.TINY, x, py + 138, Gui.B_DIM);
         } else gui.text("Press READY. The host starts the game.", Gui.TINY, x, py + 100, Gui.B_DIM);
-        if (notice != null) gui.text(notice, Gui.TINY, x, py + 66, Gui.B_TEXT);
+        if (notice != null) gui.text(notice, Gui.TINY, x, n.isHost() ? py + 120 : py + 66, Gui.B_TEXT);
 
         float ay = py + 16, bh = 34;
         boolean allReady = Lobby.myReady && !Lobby.members.isEmpty();
         for (Lobby.Member m : Lobby.members.values()) allReady &= m.ready;
         gui.bbutton("close", n.isHost() ? "CLOSE LOBBY" : "LEAVE", x, ay, 130, bh, true, () -> { n.disconnect(); Lobby.myReady = false; notice = null; });
         gui.bbutton("ready", Lobby.myReady ? "NOT READY" : "READY", x + 140, ay, 120, bh, true, () -> { Lobby.myReady = !Lobby.myReady; Lobby.sendNow(n); });
+        if (n.isHost()) gui.bbutton("hset", "SETTINGS", x + 140, ay + bh + 8, 120, bh, true, () -> { page = Page.HOSTSET; notice = null; }); // 0.9.0.0
         if (n.isHost()) {
             gui.bbutton("startn", "NEW CAMPAIGN", x + w - 320, ay + bh + 8, 170, bh, allReady, () -> start("newcampaign"));
             gui.bbutton("startc", "SAVED CAMPAIGN", x + w - 320, ay, 170, bh, allReady, () -> start("campaign"));
@@ -389,7 +471,7 @@ public class TitleMenu extends BaseEveryFrameCombatPlugin {
         NetManager n = net();
         boolean fresh = "newcampaign".equals(Lobby.startedWhat);
         boolean campaign = fresh || "campaign".equals(Lobby.startedWhat);
-        float pw = 620, ph = 220, px = cx() - pw / 2f, py = H * 0.62f - ph;
+        float pw = 620, ph = 220, px = cx() - pw / 2f, py = under(H, 0.62f) - ph;
         Gui.bpanel(px, py, pw, ph);
         float x = px + 26, w = pw - 52, top = py + ph - 22;
         heading(campaign ? "SHARED CAMPAIGN" : "CO-OP BATTLE", top);
@@ -398,6 +480,7 @@ public class TitleMenu extends BaseEveryFrameCombatPlugin {
             String save = n.isHost() ? n.newestSave : n.receivedSave;
             if (fresh && n.isHost()) l1 = "Create your new game. It is sent to everyone as soon as you reach the map.";
             else if (fresh && save.isEmpty()) l1 = "The host is creating a new campaign - it arrives when they reach the map.";
+            else if (!n.isHost() && n.receivingSave) l1 = "The host's save is arriving - wait for it to finish before loading."; // 0.9.1.3
             else l1 = save.isEmpty() ? "Waiting for the host's save..." : "Load the save: " + NetManager.saveLabel(save);
             l2 = n.sharedSaves > 0 ? NetManager.SHARED_SAVES_WARNING : n.saveStatus;
         } else {
@@ -408,7 +491,7 @@ public class TitleMenu extends BaseEveryFrameCombatPlugin {
         if (l2 != null && !l2.isEmpty()) gui.textCentered(l2, Gui.TINY, cx(), top - 70, Gui.B_DIM);
         if (fresh && n.isHost()) gui.bbutton("go", "NEW GAME", x, py + 20, w - 160, 44, true, () -> vanilla("NEW_GAME"));
         else gui.bbutton("go", campaign ? "LOAD GAME" : "MISSIONS", x, py + 20, w - 160, 44,
-                !campaign || n.isHost() || !n.receivedSave.isEmpty(), () -> vanilla(campaign ? "LOAD_GAME" : "MISSIONS"));
+                !campaign || n.isHost() || (!n.receivedSave.isEmpty() && !n.receivingSave), () -> vanilla(campaign ? "LOAD_GAME" : "MISSIONS")); // 0.9.1.3: not while a save is still arriving
         gui.bbutton("lobby", "LOBBY", x + w - 150, py + 20, 150, 44, true, () -> { Lobby.backToLobby(n); page = Page.MULTI; });
     }
 }

@@ -36,6 +36,11 @@ public final class Gui {
         return false;
     }
 
+    /** An invisible click area (later ones win over earlier ones). */
+    public void hit(String id, float x, float y, float w, float h, Runnable action) {
+        Hit hb = new Hit(); hb.x = x; hb.y = y; hb.w = w; hb.h = h; hb.id = id; hb.action = action; building.add(hb);
+    }
+
     public boolean over(float x, float y, float w, float h) { return mouseX >= x && mouseX <= x + w && mouseY >= y && mouseY <= y + h; }
 
     public static float sw() { return Global.getSettings().getScreenWidth(); }

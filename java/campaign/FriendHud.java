@@ -38,6 +38,11 @@ public final class FriendHud implements CampaignUIRenderingListener {
     @Override public void renderInUICoordsBelowUI(ViewportAPI vp) {
         long t0 = starmp.diag.Perf.begin();
         try { draw(vp); } catch (Throwable t) { if (!errLogged) { errLogged = true; StarMPPlugin.flog("friend hud: " + StarMPPlugin.trace(t)); } }
+        try { // 0.9.0.0 map pings
+            SectorAPI sector = Global.getSector();
+            if (sector != null && sector.getPlayerFleet() != null && sector.getPlayerFleet().getContainingLocation() != null && !sector.getCampaignUI().isShowingDialog())
+                Pings.drawCampaign(vp, sector.getPlayerFleet().getContainingLocation().getId());
+        } catch (Throwable t) { if (!errLogged) { errLogged = true; StarMPPlugin.flog("pings: " + StarMPPlugin.trace(t)); } }
         starmp.diag.Perf.end("HUD", t0);
     }
     @Override public void renderInUICoordsAboveUIBelowTooltips(ViewportAPI vp) {}
@@ -63,8 +68,9 @@ public final class FriendHud implements CampaignUIRenderingListener {
         for (Map.Entry<Integer, CampaignFleetAPI> e : friends.entrySet()) {
             CampaignFleetAPI f = e.getValue();
             if (f.getContainingLocation() != here) continue;
+            if (Relations.hidden(e.getKey())) continue; // 0.9.2.1: hostile and not visible - no name, no arrow
             if (!begun) { gui.begin(); begun = true; }
-            String name = starmp.combat.CoopState.nameOf(net, e.getKey());
+            String name = Alliances.tagged(starmp.combat.CoopState.nameOf(net, e.getKey())); // 0.9.2.2: [TAG] Name
             // label over their fleet
             if (vp.isNearViewport(f.getLocation(), f.getRadius() + 300f)) {
                 float x = vp.convertWorldXtoScreenX(f.getLocation().x);
@@ -73,7 +79,6 @@ public final class FriendHud implements CampaignUIRenderingListener {
                 shadowText(name, x, y - 14);
             }
             // direction marker
-            if (CoopCampaign.atWar(e.getKey())) continue;
             float dx = f.getLocation().x - me.getLocation().x, dy = f.getLocation().y - me.getLocation().y;
             float dist = (float) Math.sqrt(dx * dx + dy * dy);
             if (here.isHyperspace() && dist > rangeUnits) continue;
@@ -113,7 +118,7 @@ public final class FriendHud implements CampaignUIRenderingListener {
                 float dx = f.getLocation().x - me.getLocation().x, dy = f.getLocation().y - me.getLocation().y;
                 float dist = (float) Math.sqrt(dx * dx + dy * dy);
                 boolean same = f.getContainingLocation() == here;
-                boolean marker = same && !CoopCampaign.atWar(e.getKey()) && !(here.isHyperspace() && dist > rangeUnits) && dist >= RING_RADIUS * 2f;
+                boolean marker = same && !Relations.hidden(e.getKey()) && !(here.isHyperspace() && dist > rangeUnits) && dist >= RING_RADIUS * 2f;
                 sb.append(" | peer ").append(e.getKey()).append(" label='").append(starmp.combat.CoopState.nameOf(net, e.getKey())).append("' fleet='").append(f.getName())
                   .append("' dist=").append(Math.round(dist)).append(same ? "" : " other-location").append(" marker=").append(marker)
                   .append(marker ? " dir=" + Math.round(Math.toDegrees(Math.atan2(dy, dx))) : "");
@@ -134,6 +139,7 @@ public final class FriendHud implements CampaignUIRenderingListener {
         for (CampaignFleetAPI f : here.getFleets()) {
             if (!vp.isNearViewport(f.getLocation(), f.getRadius() + 300f)) continue;
             Integer peer = owner.get(f);
+            if (peer != null && Relations.hidden(peer)) continue; // 0.9.2.1
             boolean fighting = f.getBattle() != null || NpcSync.puppetInBattle(f) || (peer != null && CoopCampaign.playerInBattle(peer));
             if (!fighting) continue;
             if (!begun) { gui.begin(); begun = true; }

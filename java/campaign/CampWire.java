@@ -33,6 +33,7 @@ public final class CampWire {
         public boolean paused;
         public long clock; // campaign timestamp, for time sync
         public boolean transponder = true; // 0.1.4.7 (appended byte)
+        public int state; // 0.9.2.5 (appended byte): 1 = docked at a market, 2 = in a dialog
         public long recvNs; // set on receive
     }
 
@@ -61,11 +62,12 @@ public final class CampWire {
     private static byte[] done(ByteBuffer b) { byte[] o = new byte[b.position()]; b.flip(); b.get(o); return o; }
 
     public static byte[] encode(Fleet f) {
-        ByteBuffer b = ByteBuffer.allocate(1 + strLen(f.loc) + strLen(f.name) + 16 + 4 + 1 + 8 + 1);
+        ByteBuffer b = ByteBuffer.allocate(1 + strLen(f.loc) + strLen(f.name) + 16 + 4 + 1 + 8 + 1 + 1);
         b.put(FLEET); putStr(b, f.loc); putStr(b, f.name);
         b.putFloat(f.x); b.putFloat(f.y); b.putFloat(f.vx); b.putFloat(f.vy);
         b.putInt(f.compHash); b.put((byte) (f.paused ? 1 : 0)); b.putLong(f.clock);
         b.put((byte) (f.transponder ? 1 : 0));
+        b.put((byte) f.state);
         return done(b);
     }
     public static Fleet decodeFleet(byte[] d) {
@@ -75,6 +77,7 @@ public final class CampWire {
         f.x = b.getFloat(); f.y = b.getFloat(); f.vx = b.getFloat(); f.vy = b.getFloat();
         f.compHash = b.getInt(); f.paused = b.get() != 0; f.clock = b.getLong();
         if (b.hasRemaining()) f.transponder = b.get() != 0;
+        if (b.hasRemaining()) f.state = b.get() & 0xFF;
         return f;
     }
 

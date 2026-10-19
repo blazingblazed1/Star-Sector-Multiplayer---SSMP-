@@ -19,7 +19,7 @@ import starmp.diag.Perf;
  */
 public final class CampDiag {
     private CampDiag() {}
-    private static long lastNs;
+    private static long lastNs, lastRelNs;
 
     static void tick(NetManager net, SectorAPI sector) {
         if (!Diag.enabled() || sector == null || sector.getPlayerFleet() == null) return;
@@ -52,9 +52,12 @@ public final class CampDiag {
                     out.add("PLAYER peer=" + e.getKey() + " name=" + NpcSync.nm(starmp.combat.CoopState.nameOf(net, e.getKey())) + " loc=" + w.loc + " x=" + Math.round(w.x) + " y=" + Math.round(w.y)
                             + " vx=" + Math.round(w.vx) + " vy=" + Math.round(w.vy) + " age_ms=" + (now - w.recvNs) / 1_000_000
                             + " shown=" + (f == null ? "no" : Math.round(f.getLocation().x) + "," + Math.round(f.getLocation().y)) + " err=" + err
-                            + " paused=" + (w.paused ? 1 : 0) + " in_battle=" + (CoopCampaign.playerInBattle(e.getKey()) ? 1 : 0));
+                            + " paused=" + (w.paused ? 1 : 0) + " in_battle=" + (CoopCampaign.playerInBattle(e.getKey()) ? 1 : 0)
+                            + " hostile=" + (Relations.hostileTo(e.getKey()) ? 1 : 0) + " hidden=" + (Relations.hidden(e.getKey()) ? 1 : 0)
+                            + " vis=" + (f == null ? "-" : String.valueOf(f.getVisibilityLevelToPlayerFleet())) + " transp=" + (w.transponder ? 1 : 0));
                 }
                 if (NpcSync.enabled()) { if (hosting) NpcSync.diagHost(out); else NpcSync.diagGuest(out, here); }
+                if (System.nanoTime() - lastRelNs > 10_000_000_000L) { lastRelNs = System.nanoTime(); Relations.diag(out); Alliances.diag(out); AllianceStorage.diag(out); } // 0.9.2.1 / 0.9.2.2
             }
             int npcs = 0;
             if (here != null) for (CampaignFleetAPI f : here.getFleets()) if (!f.isPlayerFleet()) npcs++;

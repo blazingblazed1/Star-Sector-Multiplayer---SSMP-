@@ -1,0 +1,24 @@
+{
+	# 0.9.0.0: where the other players are, on the main map (Tab) - never shown in the campaign view, never saved
+	"starmp_player_marker":{
+		"defaultRadius":10,
+		"icon":"graphics/starmp/player_marker.png",
+		"iconWidth":40,
+		"iconHeight":40,
+		"iconColor":[255,255,255,255],
+		"showInCampaign":false,
+		"showIconOnMap":true,
+		"showNameOnMap":true,
+		"nameFont":"graphics/fonts/insignia25LTaa.fnt",
+		"nameFontScale":0.7,
+		"nameAngle":0,
+		"nameColor":[140,200,255,255],
+		"nameShadowColor":[0,0,0,255],
+		"scaleNameWithZoom":false,
+		"scaleIconWithZoom":false,
+		"renderCircleIndicator":false,
+		"renderCircleIndicatorSelectionFlash":false,
+		"defaultName":"Player",
+		"layers":[STATIONS],
+	},
+}

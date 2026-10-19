@@ -48,6 +48,8 @@ public final class NetManager {
     private String playerName = "Player";
     // save transfer state (shown by the menu)
     public volatile String newestSave = "", saveStatus = "", receivedSave = "";
+    /** 0.9.1.3: a save is being received right now - its files may be half written, so nothing may load it yet. */
+    public volatile boolean receivingSave;
     /** 0.1.5.9: other StarMP games on this PC using the same saves folder (multibox from one install). */
     public volatile int sharedSaves;
     public static final String SHARED_SAVES_WARNING = "Another Starsector on this PC uses this same saves folder - saves will clash. Start extra windows from the Multibox copies.";
@@ -155,7 +157,7 @@ public final class NetManager {
                 String name = String.valueOf(e.get("name"));
                 peers.put(peer, new Peer(peer, name));
                 log((host ? "player joined: " : "connected to host: ") + name + " (id " + peer + ")");
-                if (host) connectedPeers.add(peer);
+                if (host) { connectedPeers.add(peer); starmp.campaign.Relations.changed(); } // 0.9.2.1: send them the standings
                 if (!host) { localId = num(e.get("you")); setState(State.CONNECTED); }
                 firePeers();
                 break;
@@ -187,16 +189,26 @@ public final class NetManager {
                 } catch (Throwable t) { log("bad message: " + t); }
                 break;
             }
+            case "lan_hosts": {
+                List<String[]> hs = new ArrayList<>();
+                String list = e.get("list") == null ? "" : String.valueOf(e.get("list"));
+                for (String ln : list.split("\n")) { String[] f = ln.split("\t"); if (f.length >= 3) hs.add(new String[]{f[0], f[1], f[2]}); }
+                lanHosts = hs; lanScanning = false;
+                if (hs.size() != lastLanCount) { lastLanCount = hs.size(); log("LAN scan: " + hs.size() + " game(s) found"); }
+                break;
+            }
             case "saves": newestSave = e.get("newest") == null ? "" : String.valueOf(e.get("newest")); break;
-            case "save_begin": saveStatus = "Receiving save " + saveLabel(String.valueOf(e.get("name"))) + "..."; log(saveStatus); break;
+            case "save_begin": receivingSave = true; saveStatus = "Receiving save " + saveLabel(String.valueOf(e.get("name"))) + "..."; log(saveStatus); break;
             case "save_progress": saveStatus = "Receiving save: " + (num(e.get("bytes")) / (1024 * 1024)) + " MB"; break;
             case "save_received":
+                receivingSave = false;
                 receivedSave = String.valueOf(e.get("name"));
                 saveStatus = "Save received: " + saveLabel(receivedSave);
                 log(saveStatus + " (" + (num(e.get("bytes")) / 1024) + " KB)");
                 break;
             case "save_sent": saveStatus = "Save sent: " + saveLabel(String.valueOf(e.get("name"))); log(saveStatus + " to peer " + e.get("peer")); break;
             case "save_error": {
+                receivingSave = false;
                 String t = String.valueOf(e.get("text"));
                 log("Save transfer failed: " + t);
                 saveStatus = "Save transfer failed" + (sharedSaves > 0 ? " - another Starsector on this PC uses the same saves folder" : ": " + (t.length() > 70 ? t.substring(0, 70) + "... (see log)" : t));
@@ -241,6 +253,16 @@ public final class NetManager {
     public String playerName() { return playerName; }
     public Peer peer(int id) { return peers.get(id); }
 
+    /** 0.9.0.0: a player changed their name (host's decision, sent to everyone). */
+    public void renamePeer(int id, String name) {
+        synchronized (peers) {
+            Peer old = peers.get(id);
+            if (old == null) return;
+            Peer p = new Peer(id, name); p.pingMs = old.pingMs; p.path = old.path; p.quicRttMs = old.quicRttMs;
+            peers.put(id, p);
+        }
+    }
+
     /** "save_HelenArgyre_8348..." -> "HelenArgyre" (the character name shown in Load Game). */
     public static String saveLabel(String folder) {
         if (folder == null || !folder.startsWith("save_")) return String.valueOf(folder);
@@ -278,6 +300,18 @@ public final class NetManager {
     public final java.util.concurrent.ConcurrentLinkedQueue<Integer> connectedPeers = new java.util.concurrent.ConcurrentLinkedQueue<>();
 
     public void setName(String n) { playerName = (n == null || n.trim().isEmpty()) ? "Player" : n.trim(); }
+
+    /** 0.9.4.0: games found on the local network (name, address, players); refreshed by lanScanIfDue(). */
+    public volatile List<String[]> lanHosts = new ArrayList<>();
+    private volatile boolean lanScanning; private volatile long lastLanScanMs; private int lastLanCount = -1;
+    public void lanScanIfDue() {
+        long now = System.currentTimeMillis();
+        if (state != State.IDLE || (lanScanning && now - lastLanScanMs < 5000) || now - lastLanScanMs < 2500) return;
+        lastLanScanMs = now; lanScanning = true;
+        try { ensureProcess(); send(Json.obj("cmd", "lan_scan")); } catch (Throwable t) { lanScanning = false; }
+    }
+    /** Join a LAN game by address ("192.168.1.5" or "192.168.1.5:24780"). */
+    public void joinLan(String addr) { join("LAN:" + addr.trim()); }
 
     public void host(boolean lanOnly) {
         if (state != State.IDLE) return;

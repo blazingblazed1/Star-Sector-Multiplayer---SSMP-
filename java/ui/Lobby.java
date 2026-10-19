@@ -141,6 +141,7 @@ public final class Lobby {
         }
         Integer p;
         while ((p = net.connectedPeers.poll()) != null) {
+            if (starmp.Session.wouldRefuse(net, p)) { StarMPPlugin.flog("lobby: not sending the game to player " + p + " (refused)"); continue; } // 0.9.0.0
             if (startedWhat != null) net.sendTo(p, encodeStart(startedWhat));
             if (hostCampaignReady) { net.sendSaveTo(p, ""); StarMPPlugin.flog("lobby: resent campaign state + save to (re)connected player " + p); }
         }

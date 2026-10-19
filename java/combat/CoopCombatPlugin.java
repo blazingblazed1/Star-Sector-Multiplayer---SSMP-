@@ -54,6 +54,12 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
     private boolean tookOver, endingCombat;
     private int fightersShown, beamsShown, missilesSteered, missileCounter;
     private boolean hadMissiles, clientOverLogged, doNotEndSet, undoneOver;
+    /** 0.9.2.5 PvP. Owner: the player whose fleet joins as the ENEMY (side 1), -1 = none. Mirror: flip = I fight on the
+     *  owner's side 1, shown locally as side 0 (so the HUD, tactical map and own-ship code work unchanged). */
+    private int pvpPeer = -1;
+    private boolean flip, pvpSpawned, pvpGaveUp;
+    private long pvpStartNs;
+    private int side(int ownerSide) { return flip && (ownerSide == 0 || ownerSide == 1) ? 1 - ownerSide : ownerSide; }
     private String lastDialog = "none", lastEngineFlags = "";
     private final Set<Integer> diagUnmatched = new HashSet<>();
     private final Map<MissileAPI, Integer> missileIds = new IdentityHashMap<>();
@@ -78,11 +84,21 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
         if (!CoopState.joiningBattle) CoopState.battleOwner = 0; // missions / Start Battle: the network host's battle
         if (CoopState.joiningBattle) {
             mirrorRole = true; CoopState.joiningBattle = false;
+            flip = CoopState.pvpFlip; CoopState.pvpFlip = false;
+            if (flip) StarMPPlugin.flog("combat: PvP - I fight on the owner's side 1 (shown as my side)");
             // the stand-in battle has nobody on either side at first: without this the engine declares it over at
             // once and leaves it ~20 s later
             engine.setDoNotEndCombat(true); doNotEndSet = true;
         }
         else mirrorRole = n0 != null && !n0.isHost() && !engine.isInCampaign(); // missions/Start Battle: the network host owns it
+        if (!mirrorRole && CoopState.pvpEnemy >= 0) { // 0.9.2.5: my PvP battle - the other player's fleet joins as the enemy
+            pvpPeer = CoopState.pvpEnemy; CoopState.pvpEnemy = -1; pvpStartNs = System.nanoTime();
+            engine.setDoNotEndCombat(true); doNotEndSet = true; // the enemy side is empty until their fleet arrives
+            // an empty enemy side counts as fleeing / beaten at once ("The enemy fleet is defeated") and both AIs stand
+            // down - keep that side "in the fight" until the other player's ships are in
+            try { for (boolean al : new boolean[]{false, true}) engine.getFleetManager(1).getTaskManager(al).setPreventFullRetreat(true); } catch (Throwable t) { StarMPPlugin.flog("pvp: prevent retreat failed: " + t); }
+            StarMPPlugin.flog("combat: PvP battle vs player " + pvpPeer);
+        }
         StarMPPlugin.flog("combat started; state=" + gs + " sim=" + engine.isSimulation() + " mission=" + engine.isMission()
                 + " keys: " + keys.describe());
     }
@@ -92,10 +108,14 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
         NetManager net = StarMPPlugin.net();
         if (net == null) return;
         starmp.ui.Background.frame(); // 0.1.5.9: keep running unfocused, capped
+        try { starmp.Session.tick(net); } catch (Throwable t) { StarMPPlugin.flog("combat session: " + t); }
+        try { starmp.campaign.CoopCampaign.combatKeepAlive(net); } catch (Throwable t) { StarMPPlugin.flog("combat keepalive: " + t); } // 0.9.3.3
+        if (starmp.ui.Chat.typing() && engine.getPlayerShip() != null) // typing in the chat: keys don't fly the ship
+            for (com.fs.starfarer.api.combat.ShipCommand c : com.fs.starfarer.api.combat.ShipCommand.values()) engine.getPlayerShip().blockCommandForOneFrame(c);
         // 0.1.5.3 debug log / performance
         try {
             starmp.diag.Perf.frame("combat");
-            if (events != null) for (InputEventAPI e : events) if (e.isKeyDownEvent() && !e.isRepeat()) starmp.diag.Diag.keyEvent(e.getEventValue(), "combat");
+            if (events != null) for (InputEventAPI e : events) if (!e.isConsumed() && e.isKeyDownEvent() && !e.isRepeat()) starmp.diag.Diag.keyEvent(e.getEventValue(), "combat");
             starmp.diag.Diag.pollKeys("combat");
             String note = starmp.diag.Diag.takeNote();
             if (note != null && engine.getCombatUI() != null) engine.getCombatUI().addMessage(1, java.awt.Color.CYAN, note);
@@ -170,13 +190,14 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
         for (Integer p : CoopState.joinRecvNs.keySet()) if (!peers.contains(p) && p != net.myId()) peers.add(p);
         spawnGuestFleets(peers);
         loadGate(net, peers);
+        pvpGate(net);
         refreshGuestCR(nowP);
         // ships brought in by another player get an automatic retreat order from the engine (their members aren't in a
         // campaign fleet on this side); cancel it while the battle runs
         if (!engine.isCombatOver()) for (ShipAPI g : guestShips.keySet()) {
             if (g.isAlive() && !g.isHulk() && g.isRetreating() && !guestRetreats.contains(g)) {
                 g.setRetreating(false, false); retreatCancels++;
-                CombatFleetManagerAPI fm = engine.getFleetManager(0);
+                CombatFleetManagerAPI fm = engine.getFleetManager(g.getOwner() == 1 ? 1 : 0);
                 DeployedFleetMemberAPI dm = fm.getDeployedFleetMember(g);
                 if (retreatCancels <= 6 || retreatCancels % 100 == 0) {
                     String why = "?";
@@ -190,7 +211,7 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
                 }
                 if (dm != null) {
                     try {
-                        CombatTaskManagerAPI tm = fm.getTaskManager(true);
+                        CombatTaskManagerAPI tm = fm.getTaskManager(g.getOwner() != 1);
                         CombatFleetManagerAPI.AssignmentInfo cur = tm.getAssignmentFor(g);
                         if (cur != null && cur.getType() == CombatAssignmentType.RETREAT) tm.removeAssignment(cur);
                         dm.setDirectRetreat(false);
@@ -260,6 +281,7 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
             if (seen == null) { pauseSeen.put(e.getKey(), pc); continue; }
             if (seen != pc) {
                 pauseSeen.put(e.getKey(), pc);
+                if (!starmp.Session.can(e.getKey(), starmp.Session.Perm.PAUSE)) { StarMPPlugin.flog("peer " + e.getKey() + " pause ignored (no permission)"); continue; } // 0.9.0.0
                 engine.setPaused(!engine.isPaused());
                 StarMPPlugin.flog("peer " + e.getKey() + " toggled pause -> paused=" + engine.isPaused());
             }
@@ -387,8 +409,8 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
             StringBuilder k = new StringBuilder(); for (Wire.Order o : list) k.append(o.key()).append(';');
             if (k.toString().equals(ordersKey.get(peer))) continue;
             ordersKey.put(peer, k.toString());
-            CombatFleetManagerAPI fm = engine.getFleetManager(0);
-            CombatTaskManagerAPI tm = fm.getTaskManager(true);
+            CombatFleetManagerAPI fm = engine.getFleetManager(peer == pvpPeer ? 1 : 0);
+            CombatTaskManagerAPI tm = fm.getTaskManager(peer != pvpPeer);
             List<CombatFleetManagerAPI.AssignmentInfo> old = ordersMade.remove(peer);
             if (old != null) for (CombatFleetManagerAPI.AssignmentInfo a : old) { try { tm.removeAssignment(a); } catch (Throwable ignored) {} }
             for (Iterator<ShipAPI> it = guestRetreats.iterator(); it.hasNext(); ) { int[] g = guestShips.get(it.next()); if (g != null && g[0] == peer) it.remove(); }
@@ -475,30 +497,37 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
         for (Map.Entry<Integer, Object[]> e : CoopState.joinFleets.entrySet()) {
             int peer = e.getKey();
             if (guestSpawned.contains(peer) || !peers.contains(peer)) continue;
+            // 0.9.2.5 PvP: wait until I have deployed, then bring them in at the edge opposite my ships
+            if (peer == pvpPeer && myDeployed() == null) continue;
             guestSpawned.add(peer);
             int flag = (Integer) e.getValue()[0];
             List<Wire.ShipDef> defs = (List<Wire.ShipDef>) e.getValue()[1];
             float mapH = engine.getMapHeight();
             ShipAPI anchor = engine.getPlayerShip();
+            final int sideG = peer == pvpPeer ? 1 : 0; // 0.9.2.5: the PvP enemy deploys on side 1, from the top edge
             // behind the owner's side: at that side's map edge (side 0 deploys from the bottom), lined up around
             // the owner's flagship x
             float bx = (anchor != null ? anchor.getLocation().x : 0) + 150f * (defs.size() - 1);
-            float by = -mapH / 2f + EDGE_IN;
+            ShipAPI dep = myDeployed();
+            float ownEdge = (dep != null ? dep : anchor) != null && (dep != null ? dep : anchor).getLocation().y > 0 ? 1f : -1f; // which edge my side came in from
+            float by = sideG == 1 ? -ownEdge * (mapH / 2f - EDGE_IN) : -mapH / 2f + EDGE_IN;
             if ("1".equals(System.getenv("STARMP_TEST_JOIN_NEAR")) && anchor != null) by = anchor.getLocation().y - 350f; // tests: right next to the owner
 
             int n = 0;
             for (Wire.ShipDef d : defs) {
                 try {
                     FleetMemberAPI m = Ships.member(d, "guest" + peer + "_" + d.id);
-                    m.setAlly(true); // another player's ship: blue, and the owner can't command it
+                    if (sideG == 0) m.setAlly(true); // another player's ship: blue, and the owner can't command it
+                    m.setOwner(sideG);                 // 0.9.2.5: the member's side decides the ship's side, not the fleet manager
                     float sx = Math.max(-engine.getMapWidth() / 2f + 800f, Math.min(engine.getMapWidth() / 2f - 800f, bx - 300 * n));
-                    CombatFleetManagerAPI fm = engine.getFleetManager(0);
+                    CombatFleetManagerAPI fm = engine.getFleetManager(sideG);
                     fm.addToReserves(m); // register like an own ship, so the engine doesn't treat it as a stray to send home
-                    ShipAPI s = fm.spawnFleetMember(m, new Vector2f(sx, by), 90f, 0f);
+                    ShipAPI s = fm.spawnFleetMember(m, new Vector2f(sx, by), sideG == 1 ? (ownEdge > 0 ? 90f : 270f) : 90f, 0f);
                     if (s == null) continue;
-                    if (!s.isAlly()) s.setAlly(true);
+                    if (sideG == 0 && !s.isAlly()) s.setAlly(true);
+                    if (s.getOwner() != sideG) { StarMPPlugin.flog("owner: guest ship " + d.hullId + " spawned on side " + s.getOwner() + " - moved to side " + sideG); s.setOwner(sideG); }
                     DeployedFleetMemberAPI dm = fm.getDeployedFleetMember(s);
-                    if (dm != null) { try { fm.getTaskManager(true).orderSearchAndDestroy(dm, false); } catch (Throwable ignored) {} }
+                    if (dm != null) { try { fm.getTaskManager(sideG == 0).orderSearchAndDestroy(dm, false); } catch (Throwable ignored) {} }
                     if (n == 0) StarMPPlugin.flog("owner: joined ship deployment record=" + (dm != null) + " inReserves=" + fm.getReservesCopy().contains(m)
                             + " ally=" + s.isAlly() + " dmAlly=" + (dm != null && dm.isAlly()) + " at " + Math.round(sx) + "," + Math.round(by));
                     s.setHitpoints(s.getMaxHitpoints() * Math.max(0.05f, d.hullFrac));
@@ -507,14 +536,75 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
                     Ships.applyCR(s, d.cr);
                     StarMPPlugin.flog("owner: guest ship " + d.hullId + " spawned {" + before + "} -> {" + Ships.crState(s) + "} peakTimeLeft=" + Math.round(s.getPeakTimeRemaining()) + "s");
                     guestShips.put(s, new int[]{peer, d.id});
-                    starmp.campaign.LootSplit.addPlayer(peer);
+                    if (sideG == 0) starmp.campaign.LootSplit.addPlayer(peer);
                     if (d.id == flag) guestFlagship.put(peer, s);
                     n++;
                 } catch (Throwable t) { StarMPPlugin.flog("host: could not bring guest ship " + d.hullId + ": " + t); }
             }
+            if (sideG == 1) {
+                pvpSpawned = true;
+                CoopState.joinRecvNs.put(peer, System.nanoTime()); // their load time counts from now
+                // the enemy side's commander gives the other player's AI ships no orders: send them in (the player's
+                // own tactical-map orders still apply on top)
+                try { engine.getFleetManager(1).getTaskManager(false).setFullAssault(true); } catch (Throwable t) { StarMPPlugin.flog("pvp: full assault failed: " + t); }
+                StarMPPlugin.flog("owner: PvP enemy " + peer + " is in with " + n + " ships at y " + Math.round(by) + " (my side's edge " + (ownEdge > 0 ? "top" : "bottom") + ")");
+            }
             StarMPPlugin.flog("host: brought " + n + " ships of peer " + peer + " into the battle" + (guestFlagship.containsKey(peer) ? " (flagship " + guestFlagship.get(peer).getName() + ")" : ""));
             NetManager nm = StarMPPlugin.net();
-            engine.getCombatUI().addMessage(1, java.awt.Color.CYAN, (nm == null ? "Player " + peer : CoopState.nameOf(nm, peer)) + " joined the battle with " + n + " ships");
+            engine.getCombatUI().addMessage(1, sideG == 1 ? java.awt.Color.RED : java.awt.Color.CYAN, (nm == null ? "Player " + peer : CoopState.nameOf(nm, peer)) + (sideG == 1 ? " is fighting you with " : " joined the battle with ") + n + " ships");
+        }
+    }
+
+    /** A ship of mine that is actually deployed on the map (not just picked on the deployment screen). */
+    private ShipAPI myDeployed() {
+        try {
+            CombatFleetManagerAPI fm = engine.getFleetManager(0);
+            for (DeployedFleetMemberAPI d : fm.getDeployedCopyDFM()) {
+                ShipAPI s = d.getShip();
+                if (s != null && !s.isFighter() && !s.isAlly() && engine.isEntityInPlay(s) && !guestShips.containsKey(s)
+                        && Math.abs(s.getLocation().y) > 300f) return s; // placed at its edge (right after deploying it can still sit at 0,0)
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    // ---- 0.9.2.5 PvP: hold the battle until the other player's fleet is in; then let it end normally
+    private long pvpMsgNs, pvpDiagNs;
+    private void pvpGate(NetManager net) {
+        if (pvpPeer < 0 || pvpGaveUp) return;
+        long now = System.nanoTime();
+        String who = CoopState.nameOf(net, pvpPeer);
+        if (pvpSpawned && now - pvpDiagNs > 10_000_000_000L) {
+            pvpDiagNs = now;
+            try {
+                CombatFleetManagerAPI f0 = engine.getFleetManager(0), f1 = engine.getFleetManager(1);
+                StarMPPlugin.flog("owner: PvP diag over=" + engine.isCombatOver() + " enemyFullRetreat=" + engine.isEnemyInFullRetreat()
+                        + " retreat0=" + f0.getTaskManager(false).isInFullRetreat() + " retreat1=" + f1.getTaskManager(false).isInFullRetreat()
+                        + " deployed=" + f0.getDeployedCopy().size() + "/" + f1.getDeployedCopy().size() + " notOverFor=" + engine.getCombatNotOverFor()
+                        + " admiral1=" + (f1.getAdmiralAI() == null ? "none" : f1.getAdmiralAI().getClass().getSimpleName()));
+            } catch (Throwable t) { StarMPPlugin.flog("owner: PvP diag failed: " + t); }
+        }
+        if (pvpSpawned) {
+            if (doNotEndSet && loaded.contains(pvpPeer)) {
+                engine.setDoNotEndCombat(false); doNotEndSet = false;
+                if (engine.isPaused() && !gateHolding) engine.setPaused(false);
+                StarMPPlugin.flog("owner: PvP - " + who + " is in; the battle ends normally from now on");
+            }
+            return;
+        }
+        if (myDeployed() == null) { pvpStartNs = now; return; } // still on the deployment screen
+        if (now - pvpStartNs > 60_000_000_000L) {
+            pvpGaveUp = true;
+            engine.setDoNotEndCombat(false); doNotEndSet = false;
+            if (engine.isPaused()) engine.setPaused(false);
+            StarMPPlugin.flog("owner: PvP - " + who + "'s fleet never arrived (60 s)");
+            try { engine.getCombatUI().addMessage(1, java.awt.Color.ORANGE, who + "'s fleet never arrived - they got away."); } catch (Throwable ignored) {}
+            return;
+        }
+        if (!engine.isPaused()) engine.setPaused(true);
+        if (now - pvpMsgNs > 3_000_000_000L) {
+            pvpMsgNs = now;
+            try { engine.getCombatUI().addMessage(1, java.awt.Color.ORANGE, "Waiting for " + who + "'s fleet..."); } catch (Throwable ignored) {}
         }
     }
 
@@ -530,6 +620,7 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
         for (Map.Entry<Integer, Long> e : CoopState.joinRecvNs.entrySet()) {
             int p = e.getKey();
             if (loaded.contains(p) || !peers.contains(p)) continue;
+            if (p == pvpPeer && !pvpSpawned) continue; // 0.9.2.5: the PvP enemy comes in after I deploy (pvpGate holds until then)
             Long in = CoopState.inputRecvNs.get(p);
             if (in != null && in > e.getValue()) { // their battle is up and sending input
                 loaded.add(p);
@@ -594,6 +685,7 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
             if (n == null) return;
             ShipAPI t = (ShipAPI) target;
             Integer victim = playerOf(t, n);
+            if (pvpPeer >= 0) return; // 0.9.2.5: no loot split in PvP
             if (victim != null) { starmp.campaign.LootSplit.taken(victim, amount); return; }
             if (t.getOwner() != 1) return;
             ShipAPI src = source instanceof ShipAPI ? (ShipAPI) source
@@ -797,14 +889,18 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
 
         // shared pause: the host decides; a local pause key press is sent to the host as a request
         if (events != null && keys.pause > 0 && keys.pause < 2000) for (InputEventAPI ev : events) {
-            if (ev.isKeyDownEvent() && ev.getEventValue() == keys.pause && !ev.isRepeat()) {
+            if (!ev.isConsumed() && ev.isKeyDownEvent() && ev.getEventValue() == keys.pause && !ev.isRepeat()) {
+                if (!starmp.Session.myCan(starmp.Session.Perm.PAUSE)) { // 0.9.0.0
+                    engine.getCombatUI().addMessage(0, java.awt.Color.ORANGE, starmp.Session.onlyWho(starmp.Session.current().pausePerm) + " can pause");
+                    continue;
+                }
                 pauseCount = (pauseCount + 1) & 0xFF;
                 StarMPPlugin.flog("client: pause request sent");
             }
         }
         // quick taps (shield toggle, vent, system) can fall between two input packets: remember them until sent
         if (events != null) for (InputEventAPI ev : events) {
-            if (ev.isRepeat()) continue;
+            if (ev.isConsumed() || ev.isRepeat()) continue; // 0.9.3.7: consumed first (isRepeat() on a consumed event throws and aborted the whole tick)
             int code = ev.isKeyDownEvent() ? ev.getEventValue() : ev.isMouseDownEvent() ? 2000 + ev.getEventValue() : -1;
             if (code < 0) continue;
             if (code == keys.shield) tapLatch |= Wire.B_SHIELD;
@@ -1135,9 +1231,10 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
             FleetMemberAPI m = Ships.member(d, "starmp_" + d.id);
             NetManager net = StarMPPlugin.net();
             boolean mine = net != null && d.player == net.myId();
-            boolean ally = d.owner == 0 && !mine && (d.player >= 0 || d.ally);
+            int ls = side(d.owner);
+            boolean ally = ls == 0 && !mine && (d.player >= 0 || d.ally);
             if (ally) m.setAlly(true);
-            CombatFleetManagerAPI fm = engine.getFleetManager(d.owner);
+            CombatFleetManagerAPI fm = engine.getFleetManager(ls);
             if (mine) fm.addToReserves(m); // a deployment record, so our tactical map can give it orders
             ShipAPI s = fm.spawnFleetMember(m, new Vector2f(st.x, st.y), st.facing, 0f);
             if (s == null) return;
@@ -1168,11 +1265,11 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
         while (!spare.isEmpty() && !spare.peekFirst().isAlive()) spare.removeFirst();
         if (spare.isEmpty()) {
             try {
-                ShipAPI lead = engine.getFleetManager(d.owner).spawnShipOrWing(d.hullId, new Vector2f(st.x, st.y), st.facing, 0f);
+                ShipAPI lead = engine.getFleetManager(side(d.owner)).spawnShipOrWing(d.hullId, new Vector2f(st.x, st.y), st.facing, 0f);
                 if (lead == null) { mirrors.put(d.id, null); return; }
                 if (lead.getWing() != null) spare.addAll(lead.getWing().getWingMembers()); else spare.add(lead);
                 NetManager net = StarMPPlugin.net();
-                boolean ally = d.owner == 0 && (net == null || d.player != net.myId()) && (d.player >= 0 || d.ally);
+                boolean ally = side(d.owner) == 0 && (net == null || d.player != net.myId()) && (d.player >= 0 || d.ally);
                 for (ShipAPI f : spare) {
                     if (ally) f.setAlly(true); f.setShipAI(new IdleShipAI()); makeInvulnerable(f); mirrorId.put(f, -1); mirrorSet.add(f); }
             } catch (Throwable t) {
@@ -1228,6 +1325,8 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
     @Override public void renderInUICoords(ViewportAPI viewport) {
         if (engine == null || titleScreen) return;
         drawPlayerLabels(viewport);
+        try { NetManager pn = StarMPPlugin.net(); if (pn != null && pn.linked()) starmp.campaign.Pings.drawCombat(viewport, myBattle(pn)); } catch (Throwable t) { if (!renderErrLogged) { renderErrLogged = true; StarMPPlugin.flog("pings (combat): " + t); } }
+        try { starmp.ui.Chat.draw(); } catch (Throwable t) { if (!renderErrLogged) { renderErrLogged = true; StarMPPlugin.flog("chat draw: " + t); } }
         starmp.diag.Diag.captureGl();
         starmp.diag.Overlay.draw(); // F10
         if (!tookOver) return;
@@ -1331,12 +1430,76 @@ public class CoopCombatPlugin extends BaseEveryFrameCombatPlugin {
         } catch (Throwable ignored) { return 0; }
     }
 
+    /** 0.9.0.0: the owner of a battle without pause permission (a guest's own battle) can't pause it either. Runs
+     *  before the game reads the keys, so consuming the key stops the pause. */
+    @Override public void processInputPreCoreControls(float amount, List<InputEventAPI> events) {
+        if (engine == null || titleScreen || events == null) return;
+        try { starmp.ui.Chat.input(events); } catch (Throwable t) { StarMPPlugin.flog("chat (combat): " + t); } // 0.9.0.0
+        try { NetManager pn = StarMPPlugin.net(); if (pn != null) combatPings(pn, events); } catch (Throwable t) { StarMPPlugin.flog("combat pings: " + t); } // before the game takes the click
+        // 0.9.3.7: quick taps (shield, vent, system) on the joiner's side are read HERE, before the game uses (consumes) them -
+        // the old check ran in advance() after the game had consumed the event, threw, and the tap never reached the owner
+        if (tookOver && keys != null) {
+            for (InputEventAPI ev : events) {
+                if (ev.isConsumed() || ev.isRepeat()) continue; // consumed first: any access to a consumed event throws
+                int code = ev.isKeyDownEvent() ? ev.getEventValue() : ev.isMouseDownEvent() ? 2000 + ev.getEventValue() : -1;
+                if (code < 0) continue;
+                if (code == keys.shield) tapLatch |= Wire.B_SHIELD;
+                if (code == keys.vent) tapLatch |= Wire.B_VENT;
+                if (code == keys.system) tapLatch |= Wire.B_SYSTEM;
+            }
+        }
+        if (tookOver || keys == null) return;
+        NetManager net = StarMPPlugin.net();
+        if (net == null || !net.linked() || starmp.Session.myCan(starmp.Session.Perm.PAUSE)) return;
+        for (InputEventAPI ev : events) {
+            if (ev.isConsumed() || !ev.isKeyDownEvent() || ev.isRepeat() || ev.getEventValue() != keys.pause) continue;
+            ev.consume();
+            engine.getCombatUI().addMessage(0, java.awt.Color.ORANGE, starmp.Session.onlyWho(starmp.Session.current().pausePerm) + " can pause");
+        }
+    }
+
+    /** 0.9.0.0: whose battle this screen shows (pings are tagged with it). */
+    private int myBattle(NetManager net) { return tookOver ? CoopState.battleOwner : net.myId(); }
+
+    /** 0.9.0.0: ping key in a battle -> ping for everyone in it; and a battle owner without pause permission can't pause. */
+    private void combatPings(NetManager net, List<InputEventAPI> events) {
+        if (events == null || !net.linked()) return;
+        int pk = starmp.campaign.Pings.key();
+        boolean sent = false;
+        for (InputEventAPI ev : events) {
+            if (ev.isConsumed()) continue;
+            boolean hit = pk >= 2000 ? ev.isMouseDownEvent() && ev.getEventValue() == pk - 2000 : ev.isKeyDownEvent() && !ev.isRepeat() && ev.getEventValue() == pk;
+            if (!hit) continue;
+            float ex = pk >= 2000 ? ev.getX() : -1, ey = pk >= 2000 ? ev.getY() : -1; // read before consume (the game refuses after)
+            ev.consume();
+            if (!sent) sent = combatPingAt(net, ex, ey);
+        }
+        // 0.9.0.1: in battles the game can take the mouse click before plugins see it - fall back to the button state
+        if (pk >= 2000) {
+            boolean down = false;
+            try { down = Mouse.isButtonDown(pk - 2000); } catch (Throwable ignored) {}
+            if (down && !pingBtnWasDown && !sent) combatPingAt(net, -1, -1);
+            pingBtnWasDown = down;
+        }
+    }
+    private boolean pingBtnWasDown;
+
+    private boolean combatPingAt(NetManager net, float mx, float my) {
+        if (engine.getCombatUI() != null && engine.getCombatUI().isShowingCommandUI()) return false; // tactical map: different view
+        ViewportAPI vp = engine.getViewport();
+        float uiScale = Global.getSettings().getScreenScaleMult();
+        if (mx < 0) { mx = Mouse.getX() / uiScale; my = Mouse.getY() / uiScale; }
+        starmp.campaign.Pings.send(starmp.campaign.Pings.COMBAT, "", vp.convertScreenXToWorldX(mx), vp.convertScreenYToWorldY(my), myBattle(net));
+        return true;
+    }
+
     private Wire.Input readInput() {
         Wire.Input in = new Wire.Input();
         in.seq = ++inputSeq;
         int b = 0;
         in.targetShip = myTargetId();
-        if (!Keyboard.isCreated() || !Mouse.isCreated()) { in.wantShip = wantShip; in.pauseCount = pauseCount; in.group = group; in.aimX = lastAimX; in.aimY = lastAimY; return in; }
+        if (starmp.Bot.combatInput(engine, in)) { in.wantShip = wantShip; in.pauseCount = pauseCount; in.group = group; lastAimX = in.aimX; lastAimY = in.aimY; return in; } // 0.1.6.5 bot test mode
+        if (starmp.ui.Chat.typing() || !Keyboard.isCreated() || !Mouse.isCreated()) { /* typing in the chat: the ship holds still */ in.wantShip = wantShip; in.pauseCount = pauseCount; in.group = group; in.aimX = lastAimX; in.aimY = lastAimY; return in; }
         Bindings k = keys;
         if (k.down(k.accel)) b |= Wire.B_ACCEL;
         if (k.down(k.back)) b |= Wire.B_BACK;

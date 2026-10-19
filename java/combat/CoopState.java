@@ -15,6 +15,10 @@ public final class CoopState {
     public static volatile long lastSnapRecvNs;
     /** Set by JoinBattleDialog right before it starts a battle: this battle mirrors the other player's battle. */
     public static volatile boolean joiningBattle;
+    /** 0.9.2.5 PvP: set right before starting a battle. Owner: the player whose fleet joins as the enemy (-1 none).
+     *  Defender: join the owner's battle on its side 1. */
+    public static volatile int pvpEnemy = -1;
+    public static volatile boolean pvpFlip;
     /** When the latest input from each peer arrived (owner side). */
     public static final ConcurrentHashMap<Integer, Long> inputRecvNs = new ConcurrentHashMap<>();
     /** Host: fleets guests want to bring into the current battle (peer -> [flagship index, ships]). */
@@ -76,7 +80,7 @@ public final class CoopState {
     private static boolean ownerBroadcast(byte t) {
         return t == Wire.SNAPSHOT || t == Wire.SHIPDEFS || t == Wire.PROJ || t == Wire.MISSILES || t == Wire.NAMES || t == 10;
     }
-    private static boolean campaignBroadcast(byte t) { return (t >= 3 && t <= 5) || t == 6 || t == starmp.campaign.CoopCampaign.PAUSE; }
+    private static boolean campaignBroadcast(byte t) { return (t >= 3 && t <= 5) || t == 6 || t == starmp.campaign.CoopCampaign.PAUSE || t == starmp.campaign.Pings.PING || t == starmp.ui.Chat.CHAT || t == starmp.Session.RENAME; }
 
     public static synchronized void install(NetManager net) {
         if (installed) return;
@@ -89,6 +93,7 @@ public final class CoopState {
 
     private static void handle(NetManager net, int peer, byte[] data, boolean relayed) {
         byte t = Wire.type(data);
+        if (!relayed && starmp.Session.refused(peer)) return; // 0.9.0.0: a kicked player is ignored until they leave
         // 3+ players: guests only talk to the host, so the host passes guests' broadcasts on to the other guests
         if (!relayed && net.isHost() && (campaignBroadcast(t) || ownerBroadcast(t))) relay(net, peer, data);
         if (t == RELAY && !net.isHost() && data.length > 2) {
@@ -146,6 +151,20 @@ public final class CoopState {
             starmp.diag.Diag.onTsync(net, peer, data);
         } else if (t == starmp.campaign.OrbitSync.ORBITS) {
             if (!net.isHost() && peer == 0) starmp.campaign.OrbitSync.onPacket(data);
+        } else if (t == starmp.Session.SETTINGS || t == starmp.Session.VOTE || t == starmp.Session.KICK || t == starmp.Session.RENAME) {
+            starmp.Session.onPacket(peer, data);
+        } else if (t >= starmp.campaign.Alliances.ALLY && t <= starmp.campaign.Alliances.ALLYSET) { // 0.9.2.2
+            starmp.campaign.Alliances.onPacket(net, peer, data);
+        } else if (t == starmp.campaign.Pvp.PVP) { // 0.9.2.5
+            starmp.campaign.Pvp.onPacket(net, peer, data);
+        } else if (t == starmp.campaign.AllianceStorage.STORE || t == starmp.campaign.AllianceStorage.STORED) { // 0.9.2.4
+            starmp.campaign.AllianceStorage.onPacket(net, peer, data);
+        } else if (t == starmp.campaign.Relations.REL || t == starmp.campaign.Relations.RELREQ) { // 0.9.2.1
+            starmp.campaign.Relations.onPacket(net, peer, data);
+        } else if (t == starmp.ui.Chat.CHAT) {
+            starmp.ui.Chat.onPacket(net, peer, data);
+        } else if (t == starmp.campaign.Pings.PING) {
+            starmp.campaign.Pings.onPacket(net, peer, data);
         } else if (t == starmp.campaign.HyperSpeed.HSET) {
             starmp.campaign.HyperSpeed.onPacket(data);
         } else if (t == starmp.campaign.PlayerRecords.PDATA) {

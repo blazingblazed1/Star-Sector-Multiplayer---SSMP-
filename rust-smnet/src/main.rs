@@ -46,7 +46,8 @@ use iroh::{
 };
 use serde_json::{json, Value};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::{mpsc, Mutex},
     task::JoinHandle,
 };
@@ -187,6 +188,16 @@ fn handle_save_frame(v: &Value, out: &Out, received: &mut u64) {
 /// 0.1.10: notices other StarMP games on this PC using the same saves folder (several windows started from one
 /// install). Each helper keeps a marker file `.starmp-instance-<pid>` in the saves folder fresh every 5 s; markers
 /// touched in the last 15 s by another pid are other running games. Reports {"ev":"shared_saves","others":n} on change.
+/// 0.1.11: this helper's marker file, deleted when the game closes (it used to stay until the next launch).
+static INSTANCE_MARKER: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 0.1.11: called once the game has closed (stdin ended): remove our `.starmp-instance-<pid>` marker.
+fn remove_instance_marker() {
+    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(p) = INSTANCE_MARKER.lock().ok().and_then(|g| g.clone()) { let _ = std::fs::remove_file(p); }
+}
+
 fn shared_saves_watch(root: std::path::PathBuf, out: Out) {
     static STARTED: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
     if let Ok(mut g) = STARTED.lock() {
@@ -196,8 +207,10 @@ fn shared_saves_watch(root: std::path::PathBuf, out: Out) {
     std::thread::spawn(move || {
         let me = std::process::id();
         let mine = root.join(format!(".starmp-instance-{me}"));
+        if let Ok(mut g) = INSTANCE_MARKER.lock() { *g = Some(mine.clone()); }
         let mut last: i64 = -1;
         loop {
+            if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) { let _ = std::fs::remove_file(&mine); return; }
             if STARTED.lock().ok().and_then(|g| g.clone()).as_ref() != Some(&root) { let _ = std::fs::remove_file(&mine); return; }
             let _ = std::fs::write(&mine, now_ms().to_string());
             let mut others = 0i64;
@@ -228,12 +241,16 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
             copy_tree(&src, &dst)?;
         } else {
             // another game on this PC may be writing the same file right now (shared saves folder): retry a few times
+            // 0.1.11: write next to it under a temporary name, then swap it in with one rename - a game reading the save
+            // never sees a half-written file (on Windows the rename waits while the game has the file open)
+            let part = to.join(format!("{}.starmp-part", entry.file_name().to_string_lossy()));
             let mut tries = 0;
             loop {
-                match std::fs::copy(&src, &dst) {
+                let r = std::fs::copy(&src, &part).and_then(|_| std::fs::rename(&part, &dst));
+                match r {
                     Ok(_) => break,
                     Err(e) if tries < 15 => { tries += 1; let _ = e; std::thread::sleep(std::time::Duration::from_millis(200)); }
-                    Err(e) => return Err(e).with_context(|| format!("copy {} -> {}", src.display(), dst.display())),
+                    Err(e) => { let _ = std::fs::remove_file(&part); return Err(e).with_context(|| format!("copy {} -> {}", src.display(), dst.display())); }
                 }
             }
         }
@@ -320,15 +337,19 @@ fn now_ms() -> u64 {
 // ---------------------------------------------------------------- one connected peer
 
 /// Pumps one established link until it ends. `peer` is the id we report to the mod.
-async fn run_peer(
-    conn: Connection,
-    mut send: iroh::endpoint::SendStream,
-    mut recv: iroh::endpoint::RecvStream,
+async fn run_peer<R, W>(
+    conn: Option<Connection>,
+    mut send: W,
+    mut recv: R,
     peer: u32,
     mut outbound: mpsc::UnboundedReceiver<Value>,
     out: Out,
     accept_saves: bool,
-) -> String {
+) -> String
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+{
     let mut ping = tokio::time::interval(PING_EVERY);
     let mut last_rx = Instant::now();
     let mut save_bytes: u64 = 0;
@@ -361,8 +382,11 @@ async fn run_peer(
                                     let ms = now_ms().saturating_sub(ts);
                                     // which network path the link uses right now (debug log / F10 overlay)
                                     let mut path = "none"; let mut qrtt = 0u64;
-                                    for p in conn.paths().iter() {
-                                        if p.is_selected() { path = if p.is_relay() { "relay" } else if p.is_ip() { "direct" } else { "other" }; qrtt = p.rtt().as_millis() as u64; }
+                                    match &conn {
+                                        Some(conn) => { for p in conn.paths().iter() {
+                                            if p.is_selected() { path = if p.is_relay() { "relay" } else if p.is_ip() { "direct" } else { "other" }; qrtt = p.rtt().as_millis() as u64; }
+                                        } }
+                                        None => { path = "direct"; } // LAN (plain TCP)
                                     }
                                     let _ = out.send(json!({"ev":"latency","peer":peer,"ms":ms,"path":path,"qrtt":qrtt}));
                                 }
@@ -407,12 +431,12 @@ async fn run_peer(
                     break "send failed".to_string();
                 }
             }
-            _ = conn.closed() => break "connection closed".to_string(),
+            _ = async { match &conn { Some(c) => { c.closed().await; } None => std::future::pending::<()>().await } } => break "connection closed".to_string(),
         }
     };
     reader.abort();
-    let _ = send.finish();
-    conn.close(0u32.into(), b"bye");
+    let _ = send.shutdown().await;
+    if let Some(c) = &conn { c.close(0u32.into(), b"bye"); }
     reason
 }
 
@@ -423,7 +447,7 @@ struct PeerHandle {
 }
 
 struct Session {
-    endpoint: Endpoint,
+    endpoint: Option<Endpoint>,
     is_host: bool,
     peers: Arc<Mutex<HashMap<u32, PeerHandle>>>,
     tasks: Vec<JoinHandle<()>>,
@@ -438,7 +462,7 @@ impl Session {
         for t in &self.tasks {
             t.abort();
         }
-        self.endpoint.close().await;
+        if let Some(ep) = &self.endpoint { ep.close().await; }
     }
 }
 
@@ -551,23 +575,8 @@ async fn start_host(name: String, lan: bool, out: Out) -> Result<Session> {
                 let res: Result<()> = async {
                     let accepting = incoming.accept().map_err(|e| anyhow!("{e}"))?;
                     let conn = accepting.await.map_err(|e| anyhow!("{e}"))?;
-                    let (mut send, mut recv) = conn.accept_bi().await.map_err(|e| anyhow!("{e}"))?;
-                    let hello = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut recv))
-                        .await
-                        .map_err(|_| anyhow!("hello timed out"))??;
-                    if hello.get("t").and_then(Value::as_str) != Some("hello") {
-                        return Err(anyhow!("expected hello"));
-                    }
-                    let name = hello.get("name").and_then(Value::as_str).unwrap_or("player").to_string();
-                    let id = next_id.fetch_add(1, Ordering::SeqCst);
-                    write_frame(&mut send, &json!({"t":"welcome","id":id,"host_name":host_name})).await?;
-                    let (tx, rx) = mpsc::unbounded_channel();
-                    peers.lock().await.insert(id, PeerHandle { tx });
-                    let _ = out.send(json!({"ev":"connected","peer":id,"name":name,"you":0}));
-                    let reason = run_peer(conn, send, recv, id, rx, out.clone(), false).await;
-                    peers.lock().await.remove(&id);
-                    let _ = out.send(json!({"ev":"peer_left","peer":id,"reason":reason}));
-                    Ok(())
+                    let (send, recv) = conn.accept_bi().await.map_err(|e| anyhow!("{e}"))?;
+                    host_serve_peer(Some(conn), send, recv, peers, next_id, out.clone(), host_name).await
                 }
                 .await;
                 if let Err(e) = res {
@@ -577,7 +586,203 @@ async fn start_host(name: String, lan: bool, out: Out) -> Result<Session> {
             });
         }
     });
-    Ok(Session { endpoint, is_host: true, peers, tasks: vec![accept_task] })
+    Ok(Session { endpoint: Some(endpoint), is_host: true, peers, tasks: vec![accept_task] })
+}
+
+
+/// Host side of one incoming link (Iroh or LAN): wait for hello, answer welcome, then pump frames until it ends.
+async fn host_serve_peer<R, W>(
+    conn: Option<Connection>,
+    mut send: W,
+    mut recv: R,
+    peers: Arc<Mutex<HashMap<u32, PeerHandle>>>,
+    next_id: Arc<AtomicU32>,
+    out: Out,
+    host_name: String,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+{
+    let hello = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut recv))
+        .await
+        .map_err(|_| anyhow!("hello timed out"))??;
+    if hello.get("t").and_then(Value::as_str) != Some("hello") {
+        return Err(anyhow!("expected hello"));
+    }
+    let name = hello.get("name").and_then(Value::as_str).unwrap_or("player").to_string();
+    let id = next_id.fetch_add(1, Ordering::SeqCst);
+    write_frame(&mut send, &json!({"t":"welcome","id":id,"host_name":host_name})).await?;
+    let (tx, rx) = mpsc::unbounded_channel();
+    peers.lock().await.insert(id, PeerHandle { tx });
+    let _ = out.send(json!({"ev":"connected","peer":id,"name":name,"you":0}));
+    let reason = run_peer(conn, send, recv, id, rx, out.clone(), false).await;
+    peers.lock().await.remove(&id);
+    let _ = out.send(json!({"ev":"peer_left","peer":id,"reason":reason}));
+    Ok(())
+}
+
+// ---------------------------------------------------------------- LAN mode (0.9.4.0): plain TCP, no Iroh
+// Host: a TCP listener plus a small UDP "who is hosting?" responder. Join: a UDP probe (broadcast on every
+// local network, plus this PC) finds hosts; the link itself is one TCP connection carrying the same frames.
+
+const LAN_PORT: u16 = 24780;
+const LAN_PREFIX: &str = "LAN:";
+const LAN_PROBE: &[u8] = b"SSMP-LAN?";
+const LAN_REPLY: &[u8] = b"SSMP-LAN!";
+
+/// IPv4 addresses (with prefix length) of this PC's network adapters, without loopback / link-local.
+fn local_ipv4s() -> Vec<(std::net::Ipv4Addr, u8)> {
+    let mut v = Vec::new();
+    let nets = sysinfo::Networks::new_with_refreshed_list();
+    for (_, data) in &nets {
+        for ipn in data.ip_networks() {
+            if let std::net::IpAddr::V4(a) = ipn.addr {
+                if a.is_loopback() || a.is_link_local() || a.is_unspecified() { continue; }
+                if !v.iter().any(|(x, _)| *x == a) { v.push((a, ipn.prefix)); }
+            }
+        }
+    }
+    v
+}
+
+fn directed_broadcast(a: std::net::Ipv4Addr, prefix: u8) -> Option<std::net::Ipv4Addr> {
+    if prefix == 0 || prefix > 30 { return None; }
+    let mask: u32 = u32::MAX << (32 - prefix as u32);
+    Some(std::net::Ipv4Addr::from((u32::from(a) & mask) | !mask))
+}
+
+async fn start_host_lan(name: String, out: Out) -> Result<Session> {
+    let listener = {
+        let mut l = None;
+        for p in LAN_PORT..LAN_PORT + 10 {
+            if let Ok(x) = TcpListener::bind(("0.0.0.0", p)).await { l = Some(x); break; }
+        }
+        match l { Some(x) => x, None => TcpListener::bind(("0.0.0.0", 0)).await.context("open the LAN port")? }
+    };
+    let port = listener.local_addr()?.port();
+    let ips = local_ipv4s();
+    let ip = ips.first().map(|x| x.0.to_string()).unwrap_or_else(|| {
+        std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| { s.connect("8.8.8.8:80")?; s.local_addr() }).map(|a| a.ip().to_string()).unwrap_or_else(|_| "127.0.0.1".into())
+    });
+    let code = format!("{LAN_PREFIX}{ip}:{port}");
+    log(&format!("hosting on the LAN (no Iroh): {code}"));
+    let _ = out.send(json!({"ev":"ready","code":code,"id":"","relay":false,"lan":true}));
+
+    let peers: Arc<Mutex<HashMap<u32, PeerHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+    let next_id = Arc::new(AtomicU32::new(1));
+    let mut tasks = Vec::new();
+
+    // discovery responder (fixed UDP port; a second host on the same PC simply isn't discoverable - join it by address)
+    match UdpSocket::bind(("0.0.0.0", LAN_PORT)).await {
+        Ok(sock) => {
+            let peers = peers.clone();
+            let host_name = name.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                loop {
+                    let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
+                    if &buf[..n] != LAN_PROBE { continue; }
+                    let players = peers.try_lock().map(|p| p.len() + 1).unwrap_or(1);
+                    let mut msg = LAN_REPLY.to_vec();
+                    msg.extend_from_slice(json!({"name":host_name,"port":port,"players":players}).to_string().as_bytes());
+                    let _ = sock.send_to(&msg, from).await;
+                }
+            }));
+        }
+        Err(e) => log(&format!("LAN discovery port {LAN_PORT} not available ({e}); joiners must type this PC's address")),
+    }
+
+    let peers2 = peers.clone();
+    let out2 = out.clone();
+    tasks.push(tokio::spawn(async move {
+        loop {
+            let Ok((stream, from)) = listener.accept().await else { continue };
+            let _ = stream.set_nodelay(true);
+            log(&format!("LAN connection from {from}"));
+            let (recv, send) = stream.into_split();
+            let (peers, out, next_id, host_name) = (peers2.clone(), out2.clone(), next_id.clone(), name.clone());
+            tokio::spawn(async move {
+                if let Err(e) = host_serve_peer(None, send, recv, peers, next_id, out.clone(), host_name).await {
+                    log(&format!("incoming LAN connection failed: {e:#}"));
+                    let _ = out.send(json!({"ev":"error","text":format!("incoming connection failed: {e}")}));
+                }
+            });
+        }
+    }));
+    Ok(Session { endpoint: None, is_host: true, peers, tasks })
+}
+
+async fn start_join_lan(addr: String, name: String, out: Out) -> Result<Session> {
+    let a = addr.trim().strip_prefix(LAN_PREFIX).unwrap_or(addr.trim()).trim().to_string();
+    let a = if a.contains(':') { a } else { format!("{a}:{LAN_PORT}") };
+    log(&format!("joining {a} over the LAN (no Iroh)"));
+    let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(a.as_str()))
+        .await
+        .map_err(|_| anyhow!("timed out connecting to {a}"))?
+        .map_err(|e| anyhow!("could not connect to {a}: {e}"))?;
+    let _ = stream.set_nodelay(true);
+    let (mut recv, mut send) = stream.into_split();
+    write_frame(&mut send, &json!({"t":"hello","name":name,"v":1})).await?;
+    let welcome = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut recv))
+        .await
+        .map_err(|_| anyhow!("host did not answer"))??;
+    if welcome.get("t").and_then(Value::as_str) != Some("welcome") {
+        return Err(anyhow!("host sent an unexpected reply"));
+    }
+    let you = welcome.get("id").and_then(Value::as_u64).unwrap_or(0);
+    let host_name = welcome.get("host_name").and_then(Value::as_str).unwrap_or("host");
+    let _ = out.send(json!({"ev":"connected","peer":0,"name":host_name,"you":you}));
+    let peers: Arc<Mutex<HashMap<u32, PeerHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+    let (tx, rx) = mpsc::unbounded_channel();
+    peers.lock().await.insert(0, PeerHandle { tx });
+    let (peers2, out2) = (peers.clone(), out.clone());
+    let task = tokio::spawn(async move {
+        let reason = run_peer(None, send, recv, 0, rx, out2.clone(), true).await;
+        peers2.lock().await.remove(&0);
+        let _ = out2.send(json!({"ev":"peer_left","peer":0,"reason":reason}));
+    });
+    Ok(Session { endpoint: None, is_host: false, peers, tasks: vec![task] })
+}
+
+/// Look for LAN hosts for ~1.3 s and report them as one "lan_hosts" event.
+async fn scan_lan(out: Out) {
+    let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0)).await else { let _ = out.send(json!({"ev":"lan_hosts","list":""})); return; };
+    let _ = sock.set_broadcast(true);
+    let mut targets: Vec<SocketAddr> = vec![
+        SocketAddr::from(([127, 0, 0, 1], LAN_PORT)),
+        SocketAddr::from(([255, 255, 255, 255], LAN_PORT)),
+    ];
+    for (ip, prefix) in local_ipv4s() {
+        if let Some(b) = directed_broadcast(ip, prefix) { targets.push(SocketAddr::new(b.into(), LAN_PORT)); }
+    }
+    let mut found: Vec<(String, String, u16, u64)> = Vec::new(); // (name, ip, port, players)
+    let end = Instant::now() + Duration::from_millis(1300);
+    let mut next_probe = Instant::now();
+    let mut buf = [0u8; 512];
+    while Instant::now() < end {
+        if Instant::now() >= next_probe {
+            for t in &targets { let _ = sock.send_to(LAN_PROBE, t).await; }
+            next_probe += Duration::from_millis(450);
+        }
+        if let Ok(Ok((n, from))) = tokio::time::timeout(Duration::from_millis(100), sock.recv_from(&mut buf)).await {
+            if n > LAN_REPLY.len() && buf[..LAN_REPLY.len()] == *LAN_REPLY {
+                if let Ok(v) = serde_json::from_slice::<Value>(&buf[LAN_REPLY.len()..n]) {
+                    let name = v.get("name").and_then(Value::as_str).unwrap_or("host").to_string();
+                    let port = v.get("port").and_then(Value::as_u64).unwrap_or(LAN_PORT as u64) as u16;
+                    let players = v.get("players").and_then(Value::as_u64).unwrap_or(1);
+                    let ip = from.ip().to_string();
+                    if !found.iter().any(|f| f.1 == ip && f.2 == port) { found.push((name, ip, port, players)); }
+                }
+            }
+        }
+    }
+    // the same host answers on 127.0.0.1 and on its LAN address: keep the real address
+    let snapshot = found.clone();
+    found.retain(|f| f.1 != "127.0.0.1" || !snapshot.iter().any(|g| g.1 != "127.0.0.1" && g.0 == f.0 && g.2 == f.2));
+    // flat string (the mod's tiny JSON reader doesn't parse arrays): one "name<TAB>addr<TAB>players" per line
+    let list: Vec<String> = found.into_iter().map(|(n, ip, p, pl)| format!("{}\t{ip}:{p}\t{pl}", n.replace(['\t', '\n', '\r'], " "))).collect();
+    let _ = out.send(json!({"ev":"lan_hosts","list":list.join("\n")}));
 }
 
 async fn start_join(code: String, name: String, out: Out) -> Result<Session> {
@@ -612,11 +817,11 @@ async fn start_join(code: String, name: String, out: Out) -> Result<Session> {
     let peers2 = peers.clone();
     let out2 = out.clone();
     let task = tokio::spawn(async move {
-        let reason = run_peer(conn, send, recv, 0, rx, out2.clone(), true).await;
+        let reason = run_peer(Some(conn), send, recv, 0, rx, out2.clone(), true).await;
         peers2.lock().await.remove(&0);
         let _ = out2.send(json!({"ev":"peer_left","peer":0,"reason":reason}));
     });
-    Ok(Session { endpoint, is_host: false, peers, tasks: vec![task] })
+    Ok(Session { endpoint: Some(endpoint), is_host: false, peers, tasks: vec![task] })
 }
 
 // ---------------------------------------------------------------- main loop
@@ -645,7 +850,7 @@ async fn real_main() -> Result<()> {
         }
     });
 
-    log(&format!("smnet {} ready (iroh transport)", env!("CARGO_PKG_VERSION")));
+    log(&format!("smnet {} ready (iroh + LAN transports)", env!("CARGO_PKG_VERSION")));
     let _ = out_tx.send(json!({"ev":"hello","version":env!("CARGO_PKG_VERSION")}));
 
     // Debug log / crash report: its own thread. Its commands are handled straight from the reader below, so they
@@ -713,7 +918,7 @@ async fn real_main() -> Result<()> {
                 }
                 let name = cmd.get("name").and_then(Value::as_str).unwrap_or("host").to_string();
                 let lan = cmd.get("lan").and_then(Value::as_bool).unwrap_or(false);
-                match start_host(name, lan, out_tx.clone()).await {
+                match if lan { start_host_lan(name, out_tx.clone()).await } else { start_host(name, lan, out_tx.clone()).await } {
                     Ok(s) => session = Some(s),
                     Err(e) => {
                         let _ = out_tx.send(json!({"ev":"error","text":format!("{e:#}")}));
@@ -727,13 +932,14 @@ async fn real_main() -> Result<()> {
                 }
                 let code = cmd.get("code").and_then(Value::as_str).unwrap_or("").to_string();
                 let name = cmd.get("name").and_then(Value::as_str).unwrap_or("player").to_string();
-                match start_join(code, name, out_tx.clone()).await {
+                match if code.trim().starts_with(LAN_PREFIX) { start_join_lan(code, name, out_tx.clone()).await } else { start_join(code, name, out_tx.clone()).await } {
                     Ok(s) => session = Some(s),
                     Err(e) => {
                         let _ = out_tx.send(json!({"ev":"error","text":format!("{e:#}")}));
                     }
                 }
             }
+            "lan_scan" => { tokio::spawn(scan_lan(out_tx.clone())); }
             "send" => {
                 if let Some(s) = &session {
                     let peer = if s.is_host { cmd.get("peer").and_then(Value::as_u64).unwrap_or(0) as u32 } else { 0 };
@@ -795,6 +1001,7 @@ async fn real_main() -> Result<()> {
                 let _ = out_tx.send(json!({"ev":"stopped"}));
             }
             "quit" => {
+                remove_instance_marker(); // first: the game may stop us 1.5 s after asking (0.1.11)
                 if let Some(s) = session.take() {
                     s.stop().await;
                 }
@@ -806,6 +1013,7 @@ async fn real_main() -> Result<()> {
         }
     }
     // stdin closed (the game exited) -> shut down cleanly.
+    remove_instance_marker();
     if let Some(s) = session.take() {
         s.stop().await;
     }

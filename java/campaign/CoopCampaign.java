@@ -92,10 +92,12 @@ public class CoopCampaign implements EveryFrameScript {
     private static String fleetNameOr(int peer) { String n = fleetName(peer); return n == null ? "a player" : n; }
 
     /** Send our HELLO (name, portrait) right away - e.g. after a portrait change. */
-    static volatile boolean helloNow;
+    public static volatile boolean helloNow;
+    /** 0.9.0.1: when the host's campaign clock last moved forward (guests; shared fast-forward follows it). */
+    static volatile long hostClockMovedNs;
 
     /** PvP hook: players at war don't get each other's markers. No PvP yet, so never. */
-    public static boolean atWar(int peer) { return false; }
+    public static boolean atWar(int peer) { return Relations.hostileTo(peer); } // 0.9.2.1
 
     private final Map<Integer, Puppet> puppets = new HashMap<>();
     private final Set<Integer> helloWarned = new HashSet<>();
@@ -117,6 +119,7 @@ public class CoopCampaign implements EveryFrameScript {
         try { PlayerFleetDialog.register(); } catch (Throwable t) { StarMPPlugin.flog("dialog plugin: " + t); }
         try { StarMPDialog.register(); } catch (Throwable t) { StarMPPlugin.flog("F8 hotkey: " + t); }
         try { Scoreboard.register(); } catch (Throwable t) { StarMPPlugin.flog("scoreboard: " + t); }
+        try { ChatHooks.register(); } catch (Throwable t) { StarMPPlugin.flog("chat: " + t); }
         try { DiagInput.register(); } catch (Throwable t) { StarMPPlugin.flog("diag input: " + t); }
         try { MarketSync.install(); } catch (Throwable t) { StarMPPlugin.flog("market sync install: " + t); }
         try { LootSplit.register(); } catch (Throwable t) { StarMPPlugin.flog("loot split: " + t); }
@@ -125,6 +128,7 @@ public class CoopCampaign implements EveryFrameScript {
         try { Global.getSector().getListenerManager().removeListenerOfClass(PauseKeyWatcher.class); Global.getSector().getListenerManager().addListener(new PauseKeyWatcher(), true); }
         catch (Throwable t) { StarMPPlugin.flog("pause watcher: " + t); }
         StarMPPlugin.flog("campaign: co-op script installed");
+        Alliances.reset(); AllianceStorage.reset(); Pvp.reset(); // 0.9.2.2: this campaign's alliances are read from its save
     }
 
     /** Called before a save: puppets must never end up in a save file. They are recreated next frame. */
@@ -132,7 +136,7 @@ public class CoopCampaign implements EveryFrameScript {
 
     /** Shared pause: one player pressing the pause key pauses / unpauses everyone. */
     public static final byte PAUSE = 18;
-    private static volatile boolean pauseKeyPressed;
+    private static volatile boolean pauseKeyPressed, pauseDenied;
     private static volatile int remotePause = -1; private static volatile int remotePauseFrom = -1;
 
     public static final class PauseKeyWatcher implements com.fs.starfarer.api.campaign.listeners.CampaignInputListener {
@@ -140,9 +144,34 @@ public class CoopCampaign implements EveryFrameScript {
         @Override public int getListenerInputPriority() { return 0; }
         @Override public void processCampaignInputPreCore(List<com.fs.starfarer.api.input.InputEventAPI> events) {
             // seen before the game handles it (it consumes the key); the new pause state is read next frame
-            for (com.fs.starfarer.api.input.InputEventAPI e : events) if (!e.isConsumed() && e.isKeyDownEvent() && !e.isRepeat() && e.getEventValue() == key) pauseKeyPressed = true;
+            CampaignUIAPI ui = Global.getSector().getCampaignUI();
+            boolean free = ui.getCurrentInteractionDialog() == null && !ui.isShowingDialog() && !ui.isShowingMenu() && ui.getCurrentCoreTab() == null;
+            int pingBtn = Pings.key() - 2000;
+            for (com.fs.starfarer.api.input.InputEventAPI e : events) {
+                if (e.isConsumed()) continue;
+                if (e.isKeyDownEvent() && !e.isRepeat() && e.getEventValue() == key) {
+                    // 0.9.0.0: no pause permission -> the key does nothing locally and asks for a vote instead
+                    if (free && !starmp.Session.myCan(starmp.Session.Perm.PAUSE)) { e.consume(); pauseDenied = true; }
+                    else pauseKeyPressed = true;
+                }
+                // 0.9.0.0: ping (middle mouse by default) on the campaign map
+                boolean pingHit = pingBtn >= 0 ? e.isMouseDownEvent() && e.getEventValue() == pingBtn : e.isKeyDownEvent() && !e.isRepeat() && e.getEventValue() == Pings.key();
+                if (free && pingHit) {
+                    com.fs.starfarer.api.campaign.CampaignFleetAPI me = Global.getSector().getPlayerFleet();
+                    com.fs.starfarer.api.combat.ViewportAPI vp = Global.getSector().getViewport();
+                    if (me != null && me.getContainingLocation() != null && vp != null) {
+                        float mx = pingBtn >= 0 ? e.getX() : org.lwjgl.input.Mouse.getX() / Global.getSettings().getScreenScaleMult();
+                        float my = pingBtn >= 0 ? e.getY() : org.lwjgl.input.Mouse.getY() / Global.getSettings().getScreenScaleMult();
+                        Pings.send(me.getContainingLocation().isHyperspace() ? Pings.HYPER : Pings.SYSTEM, me.getContainingLocation().getId(),
+                                vp.convertScreenXToWorldX(mx), vp.convertScreenYToWorldY(my), 0);
+                        e.consume();
+                    }
+                }
+            }
         }
-        @Override public void processCampaignInputPreFleetControl(List<com.fs.starfarer.api.input.InputEventAPI> events) {}
+        @Override public void processCampaignInputPreFleetControl(List<com.fs.starfarer.api.input.InputEventAPI> events) {
+            if (starmp.Session.sharedFastForward() || guestPace != 1f) SharedSpeed.force(); // 0.9.0.0: everyone fast-forwards together; 0.9.3.0: a guest catching up to / waiting for the host's time
+        }
         @Override public void processCampaignInputPostCore(List<com.fs.starfarer.api.input.InputEventAPI> events) {}
     }
 
@@ -155,7 +184,12 @@ public class CoopCampaign implements EveryFrameScript {
 
     public static void onPacket(int peer, byte type, byte[] d) {
         if (type == PAUSE && d.length >= 2) { remotePause = d[1]; remotePauseFrom = peer; return; }
-        if (type == CampWire.FLEET) { CampWire.Fleet f = CampWire.decodeFleet(d); f.recvNs = System.nanoTime(); fleets.put(peer, f); }
+        if (type == CampWire.FLEET) {
+            CampWire.Fleet f = CampWire.decodeFleet(d); f.recvNs = System.nanoTime();
+            CampWire.Fleet old = fleets.get(peer);
+            if (peer == 0 && old != null && f.clock > old.clock) hostClockMovedNs = f.recvNs; // 0.9.0.1: the host's world is moving
+            fleets.put(peer, f);
+        }
         else if (type == CampWire.COMP) comps.put(peer, CampWire.decodeComp(d));
         else if (type == CampWire.HELLO) hellos.put(peer, CampWire.decodeHello(d));
         else if (type == CampWire.GIFT) { Object[] g = CampWire.decodeGift(d); pendingGifts.add(g); }
@@ -169,6 +203,10 @@ public class CoopCampaign implements EveryFrameScript {
     public void advance(float amount) {
         if (BackgroundSim.nested && !BackgroundSim.inCombat) return; // our own nested engine step (never-pause): this frame was already handled
         starmp.ui.Background.frame(); // 0.1.5.9: keep running unfocused, capped
+        try { AllianceTab.tick(); } catch (Throwable t) { StarMPPlugin.flog("alliance tab error: " + t); } // 0.9.2.4: Intel screen tab 4
+        FactionList.tick();
+        SupplyGuard.tick();
+        if (System.getenv("STARMP_TEST_CLOCKRATE") != null) testClockRate(amount); // test hook: in-game days per real second vs fps
         // 0.1.5.3 debug log / performance (one call per rendered frame)
         try {
             starmp.diag.Perf.frame("campaign");
@@ -217,6 +255,15 @@ public class CoopCampaign implements EveryFrameScript {
         boolean hosting = net.isHost() && net.state() == NetManager.State.HOSTING;
         boolean client = !net.isHost() && net.state() == NetManager.State.CONNECTED;
         updatePlayersIntel(hosting || client);
+        if (!uiSetDone && System.getenv("STARMP_TEST_UISET") != null && client && PlayerRecords.ready()) { // test hook: put an ability on bar 2 slot 4
+            uiSetDone = true;
+            try { ((com.fs.starfarer.api.campaign.PersistentUIDataAPI.AbilitySlotAPI) UiData.bars(sector.getUIData().getAbilitySlotsAPI())[1][3]).setAbilityId(System.getenv("STARMP_TEST_UISET")); StarMPPlugin.flog("TEST: bar 2 slot 4 = " + System.getenv("STARMP_TEST_UISET")); }
+            catch (Throwable t) { StarMPPlugin.flog("TEST uiset failed: " + t); }
+        }
+        if (!uiTestDone && "1".equals(System.getenv("STARMP_TEST_UIDATA")) && !sector.getCampaignUI().isShowingDialog()) { uiTestDone = true; UiDataTest.run(); } // test hook
+        try { Relations.tick(net); } catch (Throwable t) { StarMPPlugin.flog("relations error: " + StarMPPlugin.trace(t)); } // 0.9.2.1
+        try { if (hosting || client) { Alliances.drain(); Alliances.tick(net); Alliances.testHook(amount); AllianceStorage.drain(); Pvp.tick(net); } } catch (Throwable t) { StarMPPlugin.flog("alliances error: " + StarMPPlugin.trace(t)); } // 0.9.2.2
+        try { starmp.Session.tick(net); sessionUi(sector, net, hosting || client); } catch (Throwable t) { StarMPPlugin.flog("session ui error: " + StarMPPlugin.trace(t)); }
         List<Integer> peers = new ArrayList<>(net.peerIds());
         if (client) { // other guests reach us through the host; count them while their positions keep coming
             long n = System.nanoTime();
@@ -246,6 +293,7 @@ public class CoopCampaign implements EveryFrameScript {
             try { TimeLock.tick(false); } catch (Throwable ignored) {}
             return;
         }
+        if (client && !BackgroundSim.inCombat) { try { starmp.Bot.campaignTick(sector); } catch (Throwable t) { StarMPPlugin.flog("bot: campaign error: " + StarMPPlugin.trace(t)); } }
         long pt = starmp.diag.Perf.begin();
         try { if (hosting) OrbitSync.hostTick(net, fleets); else OrbitSync.guestTick(sector); } catch (Throwable t) { StarMPPlugin.flog("orbit sync error: " + t); }
         starmp.diag.Perf.end("Sub:Orbits", pt);
@@ -288,6 +336,10 @@ public class CoopCampaign implements EveryFrameScript {
             f.name = net.playerName() + "'s fleet";
             f.x = me.getLocation().x; f.y = me.getLocation().y;
             f.vx = me.getVelocity().x; f.vy = me.getVelocity().y;
+            // 0.9.3.7: in a dialog / trade / station screen / core tab our game doesn't move the fleet but its velocity is still the old
+            // one: the others kept pushing our marker along it and snapped it back on every update (a spazzing marker). Report standing still.
+            { CampaignUIAPI uiV = sector.getCampaignUI();
+              if (uiV.getCurrentInteractionDialog() != null || uiV.isShowingDialog() || uiV.isShowingMenu() || uiV.getCurrentCoreTab() != null) { f.vx = 0f; f.vy = 0f; } }
             CampWire.Comp comp = composition(me);
             f.compHash = comp.hulls.hashCode() * 31 + comp.names.hashCode();
             CampaignUIAPI uiP = sector.getCampaignUI();
@@ -295,7 +347,13 @@ public class CoopCampaign implements EveryFrameScript {
             f.paused = userPaused; // a dialog pausing my game is not a pause for everyone
             f.clock = sector.getClock().getTimestamp();
             f.transponder = me.isTransponderOn();
+            try { // 0.9.2.5: for the PvP rules on the host
+                InteractionDialogAPI dd = uiP.getCurrentInteractionDialog();
+                SectorEntityToken tgt = dd == null ? null : dd.getInteractionTarget();
+                f.state = (tgt != null && tgt.getMarket() != null && !(tgt instanceof CampaignFleetAPI) ? 1 : 0) | (dd != null ? 2 : 0); // battles: CoopCampaign.battleOf
+            } catch (Throwable ignored) {}
             send(net, CampWire.encode(f));
+            lastSentFleet = f;
             if (f.compHash != lastCompHash || now - lastCompNs > 5_000_000_000L) {
                 lastCompHash = f.compHash; lastCompNs = now;
                 send(net, CampWire.encode(comp));
@@ -398,6 +456,11 @@ public class CoopCampaign implements EveryFrameScript {
                 StarMPPlugin.flog("campaign: following the host's pause state (" + (h.paused ? "paused" : "running") + ")");
             }
         }
+        if (pauseDenied) {
+            pauseDenied = false;
+            String m = starmp.Session.request(sector.isPaused() ? starmp.Session.V_UNPAUSE : starmp.Session.V_PAUSE);
+            if (m != null) notify(m);
+        }
         if (pauseKeyPressed) { pauseKeyPressed = false; pauseReadIn = 2; lastOwnPauseNs = System.nanoTime(); }
         if (pauseReadIn > 0 && --pauseReadIn == 0) { // read the new state a couple of frames after the key (the game applies it after us)
             lastOwnPauseNs = System.nanoTime();
@@ -406,14 +469,31 @@ public class CoopCampaign implements EveryFrameScript {
             StarMPPlugin.flog("campaign: I " + (p ? "paused" : "unpaused") + " - telling the others");
         }
         int rp = remotePause;
+        if (rp >= 0 && !starmp.Session.can(remotePauseFrom, starmp.Session.Perm.PAUSE)) { // 0.9.0.0: not theirs to do
+            StarMPPlugin.flog("campaign: ignored a pause from player " + remotePauseFrom + " (no permission)");
+            remotePause = -1; rp = -1;
+        }
         if (rp >= 0) {
             CampaignUIAPI ui = sector.getCampaignUI();
             if (ui.getCurrentInteractionDialog() != null || ui.isShowingDialog() || ui.isShowingMenu()) return; // apply once the screen is free
             remotePause = -1;
+            lastOwnPauseNs = System.nanoTime(); // 0.9.0.0: position packets sent before this pause must not undo it
             sector.setPaused(rp == 1);
             String name = starmp.combat.CoopState.nameOf(net, remotePauseFrom);
             notify("StarMP: " + name + (rp == 1 ? " paused" : " unpaused") + " the game");
         }
+    }
+
+    /** 0.9.0.0: the host pauses / unpauses everyone (a passed vote or an allowed request). Game thread. */
+    public static void hostSetPause(boolean paused, String by) {
+        NetManager net = StarMPPlugin.net();
+        SectorAPI sector = Global.getSector();
+        if (net == null || sector == null) return;
+        sector.setPaused(paused);
+        if (instance != null) { instance.lastOwnPauseNs = System.nanoTime(); instance.userPaused = paused; } // what everyone follows
+        net.sendAll(new byte[]{PAUSE, (byte) (paused ? 1 : 0)});
+        notify("StarMP: game " + (paused ? "paused" : "unpaused") + " (" + by + ")");
+        StarMPPlugin.flog("campaign: host " + (paused ? "paused" : "unpaused") + " for everyone (" + by + ")");
     }
 
     /**
@@ -421,13 +501,43 @@ public class CoopCampaign implements EveryFrameScript {
      * coming out of a battle, a late loader) jumps their date forward to it. Skipped time is not simulated, so it
      * costs nothing (no supplies, fuel or crew) and repairs nothing.
      */
+    /** 0.9.3.0: guest world speed (1 = normal) - slightly faster while behind the host's game time, slower while
+     *  ahead, so the guest's clock (and with it planets, timers, everything) follows the host's without jumps.
+     *  Applied through the fast-forward speed (TimeLock / SharedSpeed). Off while the host's world isn't moving. */
+    static volatile float guestPace = 1f;
+    private float paceErrDays; private long paceLogNs;
+
+    private void pace(SectorAPI sector) {
+        NetManager n = StarMPPlugin.net();
+        CampWire.Fleet h = fleets.get(0);
+        long now = System.nanoTime();
+        if (n == null || n.isHost() || h == null || h.clock == 0 || now - hostClockMovedNs > 1_000_000_000L || now - h.recvNs > 2_000_000_000L
+                || sector.isPaused()) { guestPace = 1f; return; }
+        float ff = starmp.Session.sharedFastForward() ? Math.max(1f, starmp.Session.current().ffMult) : 1f;
+        float spd = sector.getClock().getSecondsPerDay();
+        // the host's clock now: its last report plus the time it has run since (at the shared speed)
+        double hostNow = h.clock + (now - h.recvNs) / 1e9 / spd * 86_400_000.0 * ff;
+        float err = (float) ((hostNow - sector.getClock().getTimestamp()) / 86_400_000.0); // days; + = I'm behind
+        paceErrDays = paceErrDays * 0.9f + err * 0.1f; // smooth out packet timing
+        float e = paceErrDays;
+        float want = Math.abs(e) < 0.004f ? 1f : Math.max(0.8f, Math.min(1.3f, 1f + 3f * e));
+        guestPace = Math.round(want * 50f) / 50f; // steps of 0.02 (no setting churn every frame)
+        if (now - paceLogNs > 30_000_000_000L || (guestPace != 1f && now - paceLogNs > 5_000_000_000L)) {
+            paceLogNs = now;
+            StarMPPlugin.flog("time: " + (e >= 0 ? "behind" : "ahead of") + " the host by " + String.format("%.3f", Math.abs(e)) + " day(s) - running at x" + guestPace);
+        }
+    }
+
     private void timeSync(SectorAPI sector, List<Integer> peers) {
+        try { pace(sector); } catch (Throwable t) { guestPace = 1f; }
         // 0.1.4.7, host authority: the host owns the calendar and never jumps to a guest's date (that skipped the
         // world's simulation); guests catch up to the host only. The host keeps running through its own menus and
         // battles (never-pause), so it doesn't fall behind.
         NetManager n0 = StarMPPlugin.net();
         boolean host = n0 != null && n0.isHost();
-        if (host && BackgroundSim.enabled()) return; // (with never-pause off the host still catches up, as before)
+        // 0.9.2.0 (Mike): the host's world freezes in fleet encounters and battles while the guests' calendars keep
+        // going - when the host is back, it picks up the furthest-ahead guest's date (that time is skipped, not
+        // simulated, on the host). Only gaps over half a day, so normal network timing never makes it hop.
         long mine = sector.getClock().getTimestamp(), target = mine; String who = null;
         for (Integer peer : peers) {
             if (!host && peer != 0) continue; // guests: only the host's clock counts
@@ -437,10 +547,11 @@ public class CoopCampaign implements EveryFrameScript {
             if (st.clock > target) { target = st.clock; who = st.name; }
         }
         float behindDays = sector.getClock().getElapsedDaysSince(target) * -1f;
-        if (behindDays < JUMP_MIN_DAYS) return;
+        if (behindDays < (host ? HOST_JUMP_MIN_DAYS : JUMP_MIN_DAYS)) return;
         CampaignUIAPI ui = sector.getCampaignUI();
         if (ui.getCurrentInteractionDialog() != null) return; // jump once the dialog is closed
         if (setClock(sector, target)) {
+            try { OrbitSync.skipTime(sector, behindDays); } catch (Throwable t) { StarMPPlugin.flog("orbits: catch-up failed: " + t); } // 0.9.2.8: planets move with the date
             jumpedDays += behindDays;
             if (behindDays >= 0.5f) notify("StarMP: caught up " + String.format("%.1f", behindDays) + " days to " + (who == null ? "the others" : who) + "'s date");
             if (System.nanoTime() - lastJumpLogNs > 10_000_000_000L) {
@@ -451,7 +562,9 @@ public class CoopCampaign implements EveryFrameScript {
     }
 
     /** Jumps further than this are applied (about 1.2 game hours: smaller gaps are just network timing). */
-    public static float JUMP_MIN_DAYS = 0.05f;
+    public static float JUMP_MIN_DAYS = 1.0f; // 0.9.3.0: smaller gaps are closed by guestPace (was 0.05 - a jump every few seconds)
+    /** 0.9.2.0: the host only follows guests after a real freeze (encounter / battle), not network jitter. */
+    public static float HOST_JUMP_MIN_DAYS = 0.5f;
     private float jumpedDays; private long lastJumpLogNs;
     private static boolean clockBroken;
 
@@ -469,6 +582,38 @@ public class CoopCampaign implements EveryFrameScript {
             StarMPPlugin.flog("campaign: cannot set the clock (" + t + ") - time sync off");
             return false;
         }
+    }
+
+    private long crNs, crTs; private int crFrames; private float crAmount; private boolean crCleared, crUnitDone;
+    private void testClockRate(float amount) {
+        SectorAPI sec = Global.getSector();
+        if (sec != null && !crCleared) { // the rig save's leftover test pirates would intercept at once
+            crCleared = true;
+            for (LocationAPI l : sec.getAllLocations()) for (CampaignFleetAPI f : new ArrayList<>(l.getFleets())) if (f.getName() != null && f.getName().contains("Test Raiders")) f.despawn();
+        }
+        if (sec != null && !crUnitDone && sec.getPlayerFleet() != null && sec.getPlayerFleet().getContainingLocation() != null) { // what unit OrbitAPI.advance takes
+            crUnitDone = true;
+            for (SectorEntityToken e : sec.getPlayerFleet().getContainingLocation().getAllEntities()) {
+                try {
+                    if (e.getOrbit() == null || e.getCircularOrbitRadius() <= 0 || e.getCircularOrbitPeriod() == 0f) continue;
+                    float a0 = e.getCircularOrbitAngle();
+                    e.getOrbit().advance(sec.getClock().getSecondsPerDay());
+                    float a1 = e.getCircularOrbitAngle();
+                    e.setCircularOrbitAngle(a0);
+                    StarMPPlugin.flog("TEST orbit unit: " + e.getId() + " advance(" + sec.getClock().getSecondsPerDay() + ") moved " + (a1 - a0) + " deg; one day is " + (360f / e.getCircularOrbitPeriod()) + " deg");
+                    break;
+                } catch (Throwable t) { StarMPPlugin.flog("TEST orbit unit failed: " + t); break; }
+            }
+        }
+        if (sec == null || sec.isPaused()) { crNs = 0; return; }
+        crAmount += amount;
+        long now = System.nanoTime(), ts = sec.getClock().getTimestamp();
+        crFrames++;
+        if (crNs == 0) { crNs = now; crTs = ts; crFrames = 0; crAmount = 0f; return; }
+        if (now - crNs < 10_000_000_000L) return;
+        float real = (now - crNs) / 1e9f, days = (ts - crTs) / 86_400_000f;
+        StarMPPlugin.flog(String.format("TEST clock rate: %.2f days in %.1f s real = %.2f s per day, %.1f fps, %.4f days per frame", days, real, real / Math.max(1e-6f, days), crFrames / real, days / Math.max(1, crFrames)) + String.format(" | advance() amount summed %.2f s over %.1f s real (%.4f s per frame)", crAmount, real, crAmount / Math.max(1, crFrames)));
+        crNs = now; crTs = ts; crFrames = 0; crAmount = 0f;
     }
 
     private boolean testPiratesSpawned, testJumped, testGuestPirates, sharedSavesWarned;
@@ -573,7 +718,7 @@ public class CoopCampaign implements EveryFrameScript {
                 if (first) sector.getCampaignUI().addMessage(intel, com.fs.starfarer.api.campaign.comm.CommMessageAPI.MessageClickAction.INTEL_TAB, intel);
             } catch (Throwable t) { StarMPPlugin.flog("campaign: battle intel failed: " + t); }
             StarMPPlugin.flog("campaign: " + b.hostName + " (player " + b.owner + ") is in battle " + b.battleId + " vs " + b.enemyName + " -> intel " + (first ? "posted" : "re-added (no message)"));
-            if (first && "1".equals(System.getenv("STARMP_TEST_AUTOJOIN"))) autoJoinPending = true; // test hook
+            if (first && (starmp.Bot.ACTIVE || "1".equals(System.getenv("STARMP_TEST_AUTOJOIN")))) autoJoinPending = true; // test hook / bot test mode
         }
     }
     private final Map<Integer, FriendBattleIntel> battleIntels = new HashMap<>();
@@ -592,11 +737,14 @@ public class CoopCampaign implements EveryFrameScript {
     static volatile int joinRequested = -1;
 
     /** The intel's Join button: open the join dialog for this battle (if still running and in range). */
-    static void openJoin(int battleId, com.fs.starfarer.api.ui.IntelUIAPI intelUi) {
+    static void openJoin(int battleId, com.fs.starfarer.api.ui.IntelUIAPI intelUi) { openJoin(battleId, intelUi, false); }
+
+    /** 0.9.2.5: force = a PvP defender joining the attacker's battle (no range check). */
+    static void openJoin(int battleId, com.fs.starfarer.api.ui.IntelUIAPI intelUi, boolean force) {
         CampWire.Battle b = battleById(battleId);
         if (!live(b)) return;
         float d = battleDistance(b);
-        if (d < 0 || d > joinRange()) return;
+        if (!force && (d < 0 || d > joinRange())) return;
         CampaignFleetAPI me = Global.getSector().getPlayerFleet();
         String stageFaction = StarMPPlugin.net().isHost() ? GUEST_FACTION : HOST_FACTION;
         CampaignFleetAPI stage = Global.getFactory().createEmptyFleet(Global.getSector().getFaction(stageFaction) != null ? stageFaction : "independent", b.hostName + "'s battle", true);
@@ -629,13 +777,50 @@ public class CoopCampaign implements EveryFrameScript {
             for (com.fs.starfarer.api.campaign.comm.IntelInfoPlugin i : new ArrayList<>(Global.getSector().getIntelManager().getIntel(PlayersIntel.class)))
                 Global.getSector().getIntelManager().removeIntel(i);
         } catch (Throwable ignored) {}
-        if (instance != null) { instance.battleIntels.clear(); instance.playersIntel = null; }
+        try {
+            for (Class<?> c : new Class<?>[]{VoteIntel.class, AllianceIntel.class})
+                for (com.fs.starfarer.api.campaign.comm.IntelInfoPlugin i : new ArrayList<>(Global.getSector().getIntelManager().getIntel(c)))
+                    Global.getSector().getIntelManager().removeIntel(i);
+        } catch (Throwable ignored) {}
+        if (instance != null) { instance.battleIntels.clear(); instance.playersIntel = null; instance.voteIntel = null; instance.allianceIntel = null; }
+        PlayerMarkers.removeAll();
     }
 
     private PlayersIntel playersIntel;
 
+    // ---- 0.9.0.0: votes, notices, player map markers
+    private VoteIntel voteIntel;
+    private boolean ffWasOn, uiTestDone, uiSetDone;
+
+    private void sessionUi(SectorAPI sector, NetManager net, boolean linked) {
+        String note;
+        while ((note = starmp.Session.notices.poll()) != null) { notify("StarMP: " + note); starmp.ui.Chat.system(note); }
+        if (starmp.Session.kickedNotice != null) { notify("StarMP: " + starmp.Session.kickedNotice); starmp.Session.kickedNotice = null; }
+        // vote prompt
+        int vid = starmp.Session.openId;
+        if (vid != 0 && (voteIntel == null || voteIntel.voteId != vid)) {
+            if (voteIntel != null) voteIntel.close();
+            voteIntel = new VoteIntel(vid, starmp.Session.openText);
+            try {
+                sector.getIntelManager().addIntel(voteIntel, true);
+                sector.getCampaignUI().addMessage(voteIntel, com.fs.starfarer.api.campaign.comm.CommMessageAPI.MessageClickAction.INTEL_TAB, voteIntel);
+            } catch (Throwable t) { StarMPPlugin.flog("vote intel failed: " + t); }
+        } else if (vid == 0 && voteIntel != null) { voteIntel.close(); voteIntel = null; }
+        // shared fast-forward note
+        boolean ff = starmp.Session.sharedFastForward();
+        if (ff != ffWasOn) { ffWasOn = ff; if (!ff) SharedSpeed.stopped(); }
+        // where everyone is, on the main map (Tab)
+        PlayerMarkers.tick(sector, net, linked);
+    }
+
     /** Keep exactly one Players intel while linked; drop it when the link ends (it is never saved). */
+    private AllianceIntel allianceIntel; // 0.9.2.2
+
     private void updatePlayersIntel(boolean linked) {
+        try { // 0.9.2.2: the Alliance (StarMP) intel, kept like the Players one
+            if (linked && allianceIntel == null) { allianceIntel = new AllianceIntel(); Global.getSector().getIntelManager().addIntel(allianceIntel, true); }
+            else if (!linked && allianceIntel != null) { allianceIntel.endImmediately(); allianceIntel = null; }
+        } catch (Throwable t) { StarMPPlugin.flog("alliance intel: " + t); }
         try {
             if (linked && playersIntel == null) {
                 playersIntel = new PlayersIntel();
@@ -648,6 +833,28 @@ public class CoopCampaign implements EveryFrameScript {
 
     private static void send(NetManager net, byte[] data) {
         if (net.isHost()) net.broadcast(data); else net.sendToHost(data);
+    }
+
+    /** 0.9.3.3: the last position packet this guest sent. */
+    private static volatile CampWire.Fleet lastSentFleet;
+    private static long lastKeepAliveNs;
+
+    /**
+     * 0.9.3.3: called every frame from the combat plugin. The campaign script doesn't run in a battle, so a fighting guest sent
+     * no position packets and the OTHER guests (who only know a player through them, 10 s window) removed its fleet from their map.
+     * Once a second a guest in a battle repeats its last position (not moving, clock 0 = "unknown" so no time sync reads it).
+     */
+    public static void combatKeepAlive(NetManager net) {
+        if (net == null || net.isHost() || net.state() != NetManager.State.CONNECTED) return;
+        CampWire.Fleet l = lastSentFleet;
+        if (l == null) return;
+        long now = System.nanoTime();
+        if (now - lastKeepAliveNs < 1_000_000_000L) return;
+        lastKeepAliveNs = now;
+        CampWire.Fleet f = new CampWire.Fleet();
+        f.loc = l.loc; f.name = l.name; f.x = l.x; f.y = l.y; f.vx = 0f; f.vy = 0f;
+        f.compHash = l.compHash; f.paused = l.paused; f.clock = 0L; f.transponder = l.transponder; f.state = l.state;
+        send(net, CampWire.encode(f));
     }
 
     private static CampWire.Comp composition(CampaignFleetAPI fleet) {

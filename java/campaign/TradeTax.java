@@ -1,5 +1,8 @@
 package starmp.campaign;
 
+import starmp.NetManager;
+import starmp.StarMPPlugin;
+
 import com.fs.starfarer.api.Global;
 import com.fs.starfarer.api.campaign.CampaignFleetAPI;
 import com.fs.starfarer.api.campaign.CargoAPI;
@@ -9,17 +12,18 @@ import com.fs.starfarer.api.fleet.FleetMemberAPI;
 /**
  * 0.1.4.10, Mike's rule: trading with or sending credits to a player who is NOT in the same star system costs the
  * SENDER a tax on top of what is sent - 100% of credits, 50% of the base value of items and ships. The tax is gone
- * (a credit sink). Hyperspace is one huge location, so there "same place" means within 2 light-years.
+ * (a credit sink). Hyperspace is one huge location, so there "same place" means within 5 light-years (both players in hyperspace).
  */
 public final class TradeTax {
     private TradeTax() {}
-    public static final float CREDIT_RATE = 1.0f, ITEM_RATE = 0.5f, HYPER_FREE_LY = 2f;
+    public static final float CREDIT_RATE = 1.0f, ITEM_RATE = 0.5f, HYPER_FREE_LY = 5f; // 0.9.1.9: 5 LY (Mike), both players in hyperspace
 
     /** Is that player somewhere else (other star system, or far away in hyperspace)? Unknown position = not taxed. */
     public static boolean remote(int peer) {
         CampWire.Fleet f = CoopCampaign.fleets.get(peer);
         CampaignFleetAPI me = Global.getSector().getPlayerFleet();
         if (f == null || f.loc == null || f.loc.isEmpty() || me == null || me.getContainingLocation() == null) return false;
+        try { NetManager n0 = StarMPPlugin.net(); if (n0 != null && Alliances.same(n0.playerName(), starmp.combat.CoopState.nameOf(n0, peer))) return false; } catch (Throwable ignored) {} // 0.9.2.2
         LocationAPI here = me.getContainingLocation();
         if (!here.getId().equals(f.loc)) return true;
         if (!here.isHyperspace()) return false;

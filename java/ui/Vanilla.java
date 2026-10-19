@@ -67,6 +67,40 @@ public final class Vanilla {
         return Class.forName(name, false, near.getClass().getClassLoader());
     }
 
+    /** 0.1.6.5 (bot test mode): load one specific save folder from the title screen, the way the vanilla Load Game
+     *  dialog does (reset the engine, CampaignGameManager load by path, switch to the campaign state). Unlike Continue
+     *  it doesn't use the "continue" path that every Starsector on the PC shares. Call from render, not advance.
+     *  Returns null when loading started, else why not. */
+    public static String loadSave(String saveDir) {
+        try {
+            Object st = titleState();
+            if (st == null) return "not on the title screen";
+            ClassLoader cl = st.getClass().getClassLoader();
+            MethodHandles.Lookup priv = MethodHandles.privateLookupIn(st.getClass(), MethodHandles.lookup());
+            Object session = priv.findGetter(st.getClass(), "session", java.util.Map.class).invoke(st);
+            Object cs = ((java.util.Map<?, ?>) session).get("campaign state in session");
+            if (cs == null) return "no campaign state in the title session";
+            Obf.setLoader(cl);
+            Obf.Ref load = null;
+            for (Obf.Ref r : Obf.staticCalls(STATE, "dialogDismissed")) // the Load Game dialog's OK runs this
+                if (r.owner.endsWith(".CampaignGameManager") && r.desc.startsWith("(Ljava/lang/String;L") && r.desc.endsWith(")Ljava/lang/String;")
+                        && MethodType.fromMethodDescriptorString(r.desc, cl).parameterCount() == 3) load = r;
+            if (load == null) return "load call not found in this game build";
+            Class<?> mgr = Class.forName(load.owner, false, cl);
+            MethodHandle mh = MethodHandles.publicLookup().findStatic(mgr, load.name, MethodType.fromMethodDescriptorString(load.desc, cl));
+            Class<?> engine = Class.forName("com.fs.starfarer.campaign.CampaignEngine", false, cl);
+            MethodHandles.publicLookup().findStatic(engine, "resetInstance", MethodType.methodType(void.class)).invoke();
+            StarMPPlugin.flog("vanilla: loading save " + saveDir);
+            Object err = mh.invoke(saveDir, cs, cs);
+            if (err != null) return "the game refused the save: " + err;
+            priv.findVirtual(st.getClass(), "goToState", MethodType.methodType(void.class, String.class)).invoke(st, "Campaign State");
+            return null;
+        } catch (Throwable t) {
+            StarMPPlugin.flog("vanilla: load save failed: " + StarMPPlugin.trace(t));
+            return String.valueOf(t);
+        }
+    }
+
     /** Runs a vanilla main-menu action by its enum name: CONTINUE, NEW_GAME, LOAD_GAME, MISSIONS, CODEX, SETTINGS,
      *  CREDITS, QUIT, COMBAT_TUTORIAL_1, COMBAT_TUTORIAL_2, COMMAND_TUTORIAL. Returns false if it couldn't. */
     public static boolean action(String name) {

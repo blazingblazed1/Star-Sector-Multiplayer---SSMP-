@@ -74,6 +74,13 @@ public final class HotJoin {
     }
 
     /** Guest, from F8: open the vanilla load screen (the host's save is the newest one). */
-    public static void openLoadScreen() { loadRequested = true; }
+    public static void openLoadScreen() {
+        NetManager net = StarMPPlugin.net();
+        if (net != null && net.receivingSave) { // 0.9.1.3: the save's files are still being written
+            try { Global.getSector().getCampaignUI().addMessage("StarMP: the host's save is still arriving - try again when it has finished"); } catch (Throwable ignored) {}
+            return;
+        }
+        loadRequested = true;
+    }
     private static volatile boolean loadRequested;
 }

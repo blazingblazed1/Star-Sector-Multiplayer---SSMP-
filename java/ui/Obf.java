@@ -117,6 +117,14 @@ public final class Obf {
         return null;
     }
 
+    /** 0.9.2.4: names of the fields declared in cls with exactly that descriptor (e.g. "Ljava/util/Map;"). */
+    public static List<String> fieldsWithDesc(String cls, String desc) {
+        List<String> out = new ArrayList<>();
+        Info in = info(cls); if (in == null) return out;
+        for (String[] f : in.fields) if (f[1].equals(desc)) out.add(f[0]);
+        return out;
+    }
+
     public static String fieldClass(String cls, String field) { return descClass(fieldDesc(cls, field)); }
 
     /** First method with that name: its descriptor. */
@@ -166,6 +174,24 @@ public final class Obf {
                 if (k <= 0 || k >= in.cp.length || !(in.cp[k] instanceof int[]) || ((int[]) in.cp[k])[0] != 9) continue;
                 int[] fr = (int[]) in.cp[k]; int[] nt = (int[]) in.cp[fr[2]];
                 out.add(new Ref(op, cname(in.cp, fr[1]), (String) in.cp[nt[1]], (String) in.cp[nt[2]]));
+            }
+        }
+        return out;
+    }
+
+    /** 0.1.6.5: invokestatic references (op 0xB8) to Methodrefs in a method body, in order. Naive byte scan. */
+    public static List<Ref> staticCalls(String cls, String method) {
+        List<Ref> out = new ArrayList<>();
+        Info in = info(cls); if (in == null) return out;
+        for (int i = 0; i < in.methods.size(); i++) {
+            String[] m = in.methods.get(i); byte[] code = in.codes.get(i);
+            if (!m[0].equals(method) || code == null) continue;
+            for (int p = 0; p + 2 < code.length; p++) {
+                if ((code[p] & 0xFF) != 0xB8) continue;
+                int k = ((code[p + 1] & 0xFF) << 8) | (code[p + 2] & 0xFF);
+                if (k <= 0 || k >= in.cp.length || !(in.cp[k] instanceof int[]) || ((int[]) in.cp[k])[0] != 10) continue;
+                int[] fr = (int[]) in.cp[k]; int[] nt = (int[]) in.cp[fr[2]];
+                out.add(new Ref(0xB8, cname(in.cp, fr[1]), (String) in.cp[nt[1]], (String) in.cp[nt[2]]));
             }
         }
         return out;

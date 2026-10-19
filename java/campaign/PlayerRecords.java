@@ -61,9 +61,29 @@ public final class PlayerRecords {
     /** Guest: our own fleet/character is settled (restored, or a new start picked). */
     static boolean ready() { return phase == 2; }
 
+    /** Host: has this campaign a saved character for that name (0.9.2.5: existing players aren't "new" for PvP)? */
+    static boolean hasRecord(String name) { try { return store().containsKey(key(name)); } catch (Throwable t) { return false; } }
+    static int recordCount() { try { return store().size(); } catch (Throwable t) { return 0; } }
+
     public static void onPacket(int peer, byte[] d) { inbox.add(new Object[]{peer, d}); }
 
     public static String key(String name) { return name == null ? "" : name.trim().toLowerCase(Locale.ROOT); }
+
+    /** 0.9.0.0, host: is this name free for a renaming player (no other saved character uses it)? */
+    public static boolean nameFree(String oldName, String newName) {
+        if (key(oldName).equals(key(newName))) return true;
+        try { return !store().containsKey(key(newName)); } catch (Throwable t) { return true; }
+    }
+
+    /** 0.9.0.0, host (game thread): a player renamed - their saved character moves to the new name. */
+    public static void renameRecord(String oldName, String newName) {
+        try {
+            Map<String, String> st = store();
+            String rec = st.remove(key(oldName));
+            if (rec != null) st.put(key(newName), rec);
+            StarMPPlugin.flog("player records: " + oldName + " -> " + newName + (rec != null ? " (record moved)" : " (no record yet)"));
+        } catch (Throwable t) { StarMPPlugin.flog("player records: rename failed: " + t); }
+    }
 
     @SuppressWarnings("unchecked")
     private static Map<String, String> store() {
@@ -198,19 +218,7 @@ public final class PlayerRecords {
         }
         for (FleetMemberAPI m : fd.getMembersListCopy()) {
             if (m.isFighterWing()) continue;
-            ShipVariantAPI v = m.getVariant();
-            List<String> w = new ArrayList<>();
-            for (String slot : v.getFittedWeaponSlots()) { String id = v.getWeaponId(slot); if (id != null) w.add(slot + "=" + id); }
-            Set<String> perma = new LinkedHashSet<>(v.getPermaMods()); perma.removeAll(v.getSMods());
-            List<String> normal = new ArrayList<>(v.getNonBuiltInHullmods()); normal.removeAll(v.getPermaMods());
-            PersonAPI cap = m.getCaptain();
-            String capId = cap == null || cap.isDefault() ? "" : (cap.isPlayer() ? "@player" : cap.getId());
-            sb.append("S\t").append(clean(m.getHullSpec().getHullId())).append('\t').append(clean(m.getShipName())).append('\t')
-              .append(m.getRepairTracker().getCR()).append('\t').append(m.getStatus().getHullFraction()).append('\t')
-              .append(v.getNumFluxVents()).append('\t').append(v.getNumFluxCapacitors()).append('\t')
-              .append(m.isMothballed() ? 1 : 0).append('\t').append(m.isFlagship() ? 1 : 0).append('\t').append(clean(capId)).append('\t')
-              .append(join(w)).append('\t').append(join(normal)).append('\t').append(join(perma)).append('\t')
-              .append(join(v.getSMods())).append('\t').append(join(v.getSModdedBuiltIns())).append('\t').append(join(v.getFittedWings())).append('\n');
+            sb.append(shipLine(m));
         }
         for (CargoStackAPI s : f.getCargo().getStacksCopy()) {
             String t, id, data = "";
@@ -223,6 +231,7 @@ public final class PlayerRecords {
             }
             sb.append("C\t").append(t).append('\t').append(clean(id)).append('\t').append(clean(data)).append('\t').append(s.getSize()).append('\n');
         }
+        UiData.capture(sb); // 0.9.0.0: toolbar / map / refit settings
         return sb.toString();
     }
 
@@ -352,6 +361,7 @@ public final class PlayerRecords {
         if (pos != null) moveTo(sector, f, at(pos, 1), fl(at(pos, 2), f.getLocation().x), fl(at(pos, 3), f.getLocation().y));
         fd.setSyncNeeded(); f.forceSync();
         try { fd.syncIfNeeded(); } catch (Throwable ignored) {}
+        UiData.apply(UiData.pick(rec)); // 0.9.0.0
         return built.size() + " ships, " + byOldId.size() + " officers, " + items + " cargo stacks, " + Math.round(Math.max(0, credits)) + " credits";
     }
 
@@ -384,6 +394,83 @@ public final class PlayerRecords {
         } catch (Throwable t) { StarMPPlugin.flog("player records: commission not restored: " + t); }
     }
 
+    /** 0.9.1.9: weapon groups as "TYPE|autofire|slot/slot;TYPE|..." (keys 1-7 stay as the player set them up). */
+    private static String groups(ShipVariantAPI v) {
+        StringBuilder sb = new StringBuilder();
+        try {
+            for (com.fs.starfarer.api.loading.WeaponGroupSpec g : v.getWeaponGroups()) {
+                if (g == null || g.getSlots().isEmpty()) continue;
+                if (sb.length() > 0) sb.append(';');
+                sb.append(g.getType().name()).append('|').append(g.isAutofireOnByDefault() ? 1 : 0).append('|').append(String.join("/", g.getSlots()));
+            }
+        } catch (Throwable t) { return ""; }
+        return sb.toString();
+    }
+
+    private static boolean applyGroups(ShipVariantAPI v, String s) {
+        if (s == null || s.isEmpty()) return false;
+        try {
+            for (String gs : s.split(";")) {
+                String[] p = gs.split("\\|", 3);
+                if (p.length < 3) continue;
+                com.fs.starfarer.api.loading.WeaponGroupSpec g = new com.fs.starfarer.api.loading.WeaponGroupSpec(com.fs.starfarer.api.loading.WeaponGroupType.valueOf(p[0]));
+                g.setAutofireOnByDefault("1".equals(p[1]));
+                for (String slot : p[2].split("/")) if (!slot.isEmpty() && v.getWeaponId(slot) != null) g.addSlot(slot);
+                if (!g.getSlots().isEmpty()) v.addWeaponGroup(g);
+            }
+            return !v.getWeaponGroups().isEmpty();
+        } catch (Throwable t) {
+            try { v.getWeaponGroups().clear(); } catch (Throwable ignored) {}
+            return false;
+        }
+    }
+
+
+    /** One "S" line (with the newline) for a ship - also used by alliance storage (0.9.2.4). */
+    static String shipLine(FleetMemberAPI m) {
+        ShipVariantAPI v = m.getVariant();
+        List<String> w = new ArrayList<>();
+        for (String slot : v.getFittedWeaponSlots()) { String id = v.getWeaponId(slot); if (id != null) w.add(slot + "=" + id); }
+        Set<String> perma = new LinkedHashSet<>(v.getPermaMods()); perma.removeAll(v.getSMods());
+        List<String> normal = new ArrayList<>(v.getNonBuiltInHullmods()); normal.removeAll(v.getPermaMods());
+        PersonAPI cap = m.getCaptain();
+        String capId = cap == null || cap.isDefault() ? "" : (cap.isPlayer() ? "@player" : cap.getId());
+        StringBuilder sb = new StringBuilder();
+        sb.append("S\t").append(clean(m.getHullSpec().getHullId())).append('\t').append(clean(m.getShipName())).append('\t')
+          .append(m.getRepairTracker().getCR()).append('\t').append(m.getStatus().getHullFraction()).append('\t')
+          .append(v.getNumFluxVents()).append('\t').append(v.getNumFluxCapacitors()).append('\t')
+          .append(m.isMothballed() ? 1 : 0).append('\t').append(m.isFlagship() ? 1 : 0).append('\t').append(clean(capId)).append('\t')
+          .append(join(w)).append('\t').append(join(normal)).append('\t').append(join(perma)).append('\t')
+          .append(join(v.getSMods())).append('\t').append(join(v.getSModdedBuiltIns())).append('\t').append(join(v.getFittedWings())).append('\t')
+          .append(clean(groups(v))).append('\n'); // 0.9.1.9: weapon groups (field 16)
+        return sb.toString();
+    }
+
+    /** "C" line fields after the C: type, id, data, amount - or null for stacks that can't be stored. */
+    static String[] stackFields(CargoStackAPI s) {
+        String t, id, data = "";
+        switch (s.getType()) {
+            case RESOURCES: t = "R"; id = s.getCommodityId(); break;
+            case WEAPONS: t = "W"; id = s.getWeaponSpecIfWeapon().getWeaponId(); break;
+            case FIGHTER_CHIP: t = "F"; id = s.getFighterWingSpecIfWing().getId(); break;
+            case SPECIAL: { SpecialItemData sd = s.getSpecialDataIfSpecial(); t = "X"; id = sd.getId(); data = sd.getData() == null ? "" : sd.getData(); break; }
+            default: return null;
+        }
+        return new String[]{t, id, data, String.valueOf(s.getSize())};
+    }
+
+    /** Adds (q > 0) or removes (q < 0) one kind of item. */
+    static void addStack(CargoAPI c, String t, String id, String data, float q) {
+        SpecialItemData sd = "X".equals(t) ? new SpecialItemData(id, data == null || data.isEmpty() ? null : data) : null;
+        CargoAPI.CargoItemType type = "R".equals(t) ? CargoAPI.CargoItemType.RESOURCES : "W".equals(t) ? CargoAPI.CargoItemType.WEAPONS
+                : "F".equals(t) ? CargoAPI.CargoItemType.FIGHTER_CHIP : CargoAPI.CargoItemType.SPECIAL;
+        Object key = sd != null ? sd : id;
+        if (q > 0) c.addItems(type, key, q); else if (q < 0) c.removeItems(type, key, -q);
+    }
+
+    /** Builds a ship from an "S" line (split on tabs). */
+    static FleetMemberAPI shipFromLine(String line) { return ship(line.replace("\n", "").split("\t", -1)); }
+
     private static FleetMemberAPI ship(String[] a) {
         try {
             ShipHullSpecAPI hull = Global.getSettings().getHullSpec(at(a, 1));
@@ -397,7 +484,7 @@ public final class PlayerRecords {
             for (int i = 0; i < wings.size(); i++) { try { v.setWingId(i, wings.get(i)); } catch (Throwable ignored) {} }
             v.setNumFluxVents(in(at(a, 5))); v.setNumFluxCapacitors(in(at(a, 6)));
             v.setSource(com.fs.starfarer.api.loading.VariantSource.REFIT);
-            v.autoGenerateWeaponGroups();
+            if (!applyGroups(v, at(a, 16))) v.autoGenerateWeaponGroups(); // 0.9.1.9: the player's own weapon groups
             FleetMemberAPI m = Global.getFactory().createFleetMember(FleetMemberType.SHIP, v);
             if (!at(a, 2).isEmpty()) m.setShipName(at(a, 2));
             m.setOwner(0);
@@ -407,6 +494,9 @@ public final class PlayerRecords {
             return null;
         }
     }
+
+    /** 0.1.6.5 bot test mode only: keep a bot in the host's system. */
+    public static void botMoveTo(SectorAPI sector, CampaignFleetAPI f, String locId, float x, float y) { moveTo(sector, f, locId, x, y); }
 
     static void moveTo(SectorAPI sector, CampaignFleetAPI f, String locId, float x, float y) {
         LocationAPI target = null;

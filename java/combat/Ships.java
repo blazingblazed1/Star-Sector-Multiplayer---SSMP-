@@ -32,6 +32,13 @@ public final class Ships {
         }
         d.mods.addAll(v.getNonBuiltInHullmods());
         d.wings.addAll(v.getFittedWings());
+        // 0.9.1.9: the player's own weapon groups (keys 1-7), so the ship fires the same groups in someone else's battle
+        try {
+            for (com.fs.starfarer.api.loading.WeaponGroupSpec g : v.getWeaponGroups()) {
+                if (g == null || g.getSlots().isEmpty()) continue;
+                d.groups.add(g.getType().name() + "|" + (g.isAutofireOnByDefault() ? 1 : 0) + "|" + String.join(",", g.getSlots()));
+            }
+        } catch (Throwable ignored) { d.groups.clear(); }
     }
 
     public static FleetMemberAPI member(Wire.ShipDef d, String variantTag) {
@@ -46,12 +53,34 @@ public final class Ships {
         }
         for (int i = 0; i < d.wings.size(); i++) { try { v.setWingId(i, d.wings.get(i)); } catch (Throwable ignored) {} }
         v.setNumFluxVents(d.vents); v.setNumFluxCapacitors(d.caps);
-        v.autoGenerateWeaponGroups();
+        if (!applyGroups(v, d)) v.autoGenerateWeaponGroups();
         FleetMemberAPI m = Global.getFactory().createFleetMember(FleetMemberType.SHIP, v);
         if (!d.name.isEmpty()) m.setShipName(d.name);
         m.getRepairTracker().setCR(Math.max(0.2f, d.cr));
         m.setOwner(d.owner);
         return m;
+    }
+
+    /** 0.9.1.9: the player's own weapon groups from the ShipDef. False = none sent (the game makes its own). */
+    private static int groupLogs;
+    private static boolean applyGroups(ShipVariantAPI v, Wire.ShipDef d) {
+        if (d.groups.isEmpty()) return false;
+        try {
+            for (String gs : d.groups) {
+                String[] p = gs.split("\\|", 3);
+                if (p.length < 3) continue;
+                com.fs.starfarer.api.loading.WeaponGroupSpec g = new com.fs.starfarer.api.loading.WeaponGroupSpec(com.fs.starfarer.api.loading.WeaponGroupType.valueOf(p[0]));
+                g.setAutofireOnByDefault("1".equals(p[1]));
+                for (String slot : p[2].split(",")) if (!slot.isEmpty() && d.slots.contains(slot)) g.addSlot(slot);
+                if (!g.getSlots().isEmpty()) v.addWeaponGroup(g);
+            }
+            if (groupLogs++ < 12) starmp.StarMPPlugin.flog("weapon groups for " + d.hullId + " (" + d.name + "): " + d.groups);
+            return !v.getWeaponGroups().isEmpty();
+        } catch (Throwable t) {
+            starmp.StarMPPlugin.flog("weapon groups from " + d.hullId + " not usable (" + t + ") - the game makes its own");
+            try { v.getWeaponGroups().clear(); } catch (Throwable ignored) {}
+            return false;
+        }
     }
 
     /**

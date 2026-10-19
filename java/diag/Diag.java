@@ -29,15 +29,17 @@ public final class Diag {
      * helper logging, no files, no hardware probe, no F9/F10, and Host/Join work without the SSMP launcher.
      * (Env STARMP_DIAG=1 turns it back on for the developer's test rig.)
      */
-    public static final boolean BUILD_LOGGER = false;
+    public static final boolean BUILD_LOGGER = true;
     public static boolean active() { return BUILD_LOGGER || "1".equals(System.getenv("STARMP_DIAG")); }
 
     public static boolean enabled() { return active() && Prefs.getBool("debugLog", true); }
 
     /** 0.1.5.5: started through the SSMP launcher (Multiplayer), so the crash logger ran before Starsector did.
      *  Host / Join need this. */
-    public static boolean launcherOk() { return !active() || System.getenv("STARMP_LAUNCHER") != null; }
-    public static final String NEED_LAUNCHER = "To host or join, start Starsector with the \"Starsector (SSMP)\" desktop shortcut and pick Multiplayer.";
+    /** 0.9.2.3: the launcher is optional - Host / Join always work (a plain Starsector start uses IROH). */
+    public static boolean launcherOk() { return true; }
+    public static boolean viaLauncher() { return System.getenv("STARMP_LAUNCHER") != null; }
+    public static final String NEED_LAUNCHER = "To host or join, start Starsector with the \"Starsector (SSMP)\" desktop shortcut and pick IROH or LAN.";
     /** Where reports go: "mods" (StarMP/crash logs + StarMP/player logs, default), "desktop" or "off". */
     public static String reportPlace() { return Prefs.get("crashReport", "mods"); }
 
@@ -107,7 +109,7 @@ public final class Diag {
                 : n.linked() ? "GUEST (my id " + n.myId() + ")" : "not linked";
         h.append("Role:          ").append(role).append('\n');
         h.append("Time zone:     ").append(tz.getID()).append('\n');
-        h.append("Started via:   ").append(launcherOk() ? "SSMP launcher " + System.getenv("STARMP_LAUNCHER") + " (Multiplayer)" : "Starsector directly (not the SSMP shortcut - host/join disabled)").append('\n');
+        h.append("Started via:   ").append(viaLauncher() ? "SSMP launcher " + System.getenv("STARMP_LAUNCHER") + " (Multiplayer)" : "Starsector directly (IROH by default)").append('\n');
         if (n != null && !n.isHost() && n.linked())
             h.append("Host clock:    this PC is ").append(-hostOffsetMs >= 0 ? "+" : "").append(-hostOffsetMs).append(" ms vs the host (measured, round trip ").append(hostRttMs).append(" ms)\n");
         h.append("Column 2:      host clock in ms since 1970 (this PC's clock corrected by the measured offset)\n");
@@ -282,6 +284,6 @@ public final class Diag {
         if (!active()) { StarMPPlugin.flog("debug log: not in this build"); return; }
         if (!enabled()) { StarMPPlugin.flog("debug log: off (F8)"); return; }
         n.startHelper(); // the crash report needs the helper for the whole session
-        line("INFO", "game started, StarMP " + StarMPPlugin.VERSION + (launcherOk() ? " (via SSMP launcher " + System.getenv("STARMP_LAUNCHER") + ")" : " (NOT via the SSMP launcher - host/join disabled)"));
+        line("INFO", "game started, StarMP " + StarMPPlugin.VERSION + (viaLauncher() ? " (via SSMP launcher " + System.getenv("STARMP_LAUNCHER") + ")" : " (started directly - IROH)"));
     }
 }

@@ -1,4 +1,4 @@
-# SSMP 0.1.6.4
+# SSMP 0.9.4.1
 
 > The desync & crash diagnostics logger is in this source but switched off: `Diag.BUILD_LOGGER = false` in
 > `java/diag/Diag.java`. Builds made that way ship `StarMP/bin/logger.off`, which tells the SSMP launcher not to start

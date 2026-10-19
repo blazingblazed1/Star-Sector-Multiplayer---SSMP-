@@ -16,6 +16,9 @@ public class PlayerFleetDialog implements InteractionDialogPlugin {
     private final CampaignFleetAPI other; // their fleet on our map, or null (opened from the scoreboard, far away)
     private final int peerId;
     private final String otherName;
+    private boolean pvpWaiting, pvpFought; // 0.9.2.5
+    static boolean autoPvp; // test hook (STARMP_TEST_ALLY "attack,<peer>")
+    private String pvpShown;
 
     public PlayerFleetDialog(CampaignFleetAPI other) {
         this.other = other;
@@ -62,10 +65,13 @@ public class PlayerFleetDialog implements InteractionDialogPlugin {
         dialog.getTextPanel().addPara("When either of you fights, the other gets an offer to join with their fleet.");
         options();
         dialog.setPromptText("");
+        if (autoPvp) { autoPvp = false; starmp.StarMPPlugin.flog("TEST: starting a PvP encounter with " + otherName); optionSelected("Start PvP encounter", "pvp"); }
     }
 
     private void options() {
         dialog.getOptionPanel().clearOptions();
+        if (pvpWaiting) return; // 0.9.2.5: no way out while the attack is being decided (at most 30 s)
+        if (pvpFought) { dialog.getOptionPanel().addOption("Leave", "leave"); return; }
         float have = Global.getSector().getPlayerFleet().getCargo().getCredits().get();
         Object pr = peerId >= 0 ? (Object) peerId : null;
         boolean remote = pr instanceof Integer && TradeTax.remote((Integer) pr);
@@ -92,11 +98,21 @@ public class PlayerFleetDialog implements InteractionDialogPlugin {
                     + (inRange ? "" : d < 0 ? " (in another location)" : " (too far: " + Math.round(d) + " / " + Math.round(range) + ")"), "join");
             if (!inRange) dialog.getOptionPanel().setEnabled("join", false);
         }
+        if (Pvp.optionVisible(peerId)) // 0.9.2.5
+            dialog.getOptionPanel().addOption("Start PvP encounter", "pvp", com.fs.starfarer.api.util.Misc.getNegativeHighlightColor(),
+                    "Attack " + otherName + ". You and " + otherName + (Alliances.of(starmp.StarMPPlugin.net().playerName()) != null ? " (and your alliances)" : "") + " become hostile.");
         dialog.getOptionPanel().addOption("Leave", "leave");
     }
 
     @Override public void optionSelected(String optionText, Object optionData) {
         if ("leave".equals(optionData)) { dialog.dismiss(); return; }
+        if ("pvp".equals(optionData)) {
+            if (!Pvp.optionVisible(peerId)) { options(); return; }
+            pvpWaiting = true; pvpShown = null;
+            Pvp.request(peerId);
+            options();
+            return;
+        }
         if ("join".equals(optionData)) {
             CampWire.Battle b = CoopCampaign.battleOf(peerId);
             if (!CoopCampaign.live(b)) { dialog.getTextPanel().addPara("The battle is over."); options(); return; }
@@ -145,8 +161,31 @@ public class PlayerFleetDialog implements InteractionDialogPlugin {
     }
 
     @Override public void optionMousedOver(String optionText, Object optionData) {}
-    @Override public void advance(float amount) {}
-    @Override public void backFromEngagement(EngagementResultAPI battleResult) {}
+    @Override public void advance(float amount) {
+        if (!pvpWaiting) return;
+        String st = Pvp.attackStatus;
+        if (st != null && !st.equals(pvpShown)) { pvpShown = st; dialog.getTextPanel().addPara(st); }
+        org.json.JSONObject r = Pvp.attackResult;
+        if (r == null) return;
+        Pvp.attackResult = null;
+        pvpWaiting = false;
+        if (r.optBoolean("denied")) { options(); return; }
+        if ("escaped".equals(r.optString("outcome"))) {
+            dialog.getTextPanel().addPara(otherName + " slipped away.", java.awt.Color.ORANGE);
+            options();
+            return;
+        }
+        dialog.getTextPanel().addPara(r.optBoolean("ambush") ? otherName + " couldn't get away - engaging!" : otherName + " turns to fight - engaging!", java.awt.Color.RED);
+        pvpFought = true;
+        options();
+        Pvp.startBattle(dialog, peerId);
+    }
+
+    @Override public void backFromEngagement(EngagementResultAPI battleResult) {
+        if (!pvpFought) return;
+        dialog.getTextPanel().addPara(Pvp.afterBattle(battleResult));
+        options();
+    }
     @Override public Object getContext() { return null; }
     @Override public Map<String, MemoryAPI> getMemoryMap() { return null; }
 }

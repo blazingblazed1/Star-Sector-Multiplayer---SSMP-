@@ -1,4 +1,0 @@
-# SHA-256 of the files in SSMP-0.1.6.4.zip (StarMP folder). Check your copy: certutil -hashfile <file> SHA256  (Linux: sha256sum)
-3237f21314ed402f4738100931efa99040f8c35006c6a5b48c6a5541c57aeec1  bin/smnet.exe
-e802699eb790c100c5c4b6d2090808001719183820ea263e8e2bf0e1515f5be1  bin/smnet-linux
-9d56cf90d6fbf8db10fa0e67f5e0ea5983e3608b26e89f468ac23c247b0a92e9  jars/StarMP.jar

@@ -2,6 +2,8 @@
 	# 0.1.5.9: don't idle while the window is unfocused and the game is paused - multiboxed / alt-tabbed copies must
 	# keep running (the mod caps their frame rate instead, see starmp.ui.Background)
 	"idleWhileWindowNotVisible":false,
+	# 0.9.2.4: rules.csv commands (alliance storage)
+	"ruleCommandPackages":["starmp.rulecmd"],
 	"plugins":{
 		"starmpCoopCombat":"starmp.combat.CoopCombatPlugin",
 		"starmpTitleMenu":"starmp.ui.TitleMenu"

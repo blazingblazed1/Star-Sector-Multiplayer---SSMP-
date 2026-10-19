@@ -14,7 +14,7 @@ import java.util.Date;
  */
 public class StarMPPlugin extends BaseModPlugin {
     public static final String MOD_ID = "starmp";
-    public static final String VERSION = "0.1.6.4";
+    public static final String VERSION = "0.9.4.1";
     private static NetManager net;
     private static final StringBuilder logBuf = new StringBuilder();
     private static volatile boolean logDirty;
@@ -110,6 +110,15 @@ public class StarMPPlugin extends BaseModPlugin {
             flog("os=" + System.getProperty("os.name") + " java=" + System.getProperty("java.version")
                     + " headless=" + java.awt.GraphicsEnvironment.isHeadless());
             try { flog("idle when unfocused (vanilla idleWhileWindowNotVisible): " + Global.getSettings().getBoolean("idleWhileWindowNotVisible") + " (SSMP sets false)"); } catch (Throwable t) { flog("idle setting: " + t); }
+            // 0.9.1.6: the SSMP launcher's IROH / LAN buttons pick the connection mode (same as the "LAN / direct only" box)
+            String netMode = System.getenv("STARMP_NET");
+            if ("lan".equalsIgnoreCase(netMode) || "iroh".equalsIgnoreCase(netMode)) {
+                try { Prefs.put("lan", String.valueOf("lan".equalsIgnoreCase(netMode))); flog("launcher picked " + netMode.toUpperCase() + " - LAN / direct only " + ("lan".equalsIgnoreCase(netMode) ? "ON" : "OFF")); }
+                catch (Throwable t) { flog("could not apply the launcher's " + netMode + " choice: " + t); }
+            } else { // 0.9.2.3: started directly (mod folder dropped in, normal Starsector launcher) -> IROH
+                try { Prefs.put("lan", "false"); flog("started without the SSMP launcher - IROH (LAN / direct only OFF; the box in the menu still works)"); }
+                catch (Throwable t) { flog("could not set IROH: " + t); }
+            }
             String exe = helperPath(dir);
             flog("helper " + exe);
             net = new NetManager(exe);

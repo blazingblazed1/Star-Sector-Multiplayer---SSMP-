@@ -1,0 +1,6 @@
+id,trigger,conditions,script,text,options,notes
+starmp_allystorage_opt,PopulateOptions,"$hasMarket
+$menuState == main
+StarMPAllyStorage available",,,11:starmp_as_open:Alliance storage,"SSMP 0.9.2.4: alliance storage at military stations the alliance is +40 with"
+starmp_allystorage_open,DialogOptionSelected,$option == starmp_as_open,StarMPAllyStorage open,,,
+starmp_allystorage_menu,DialogOptionSelected,StarMPAllyStorage mine,StarMPAllyStorage option,,,

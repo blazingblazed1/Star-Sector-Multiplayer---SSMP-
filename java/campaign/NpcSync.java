@@ -6,6 +6,7 @@ import com.fs.starfarer.api.campaign.rules.MemoryAPI;
 import com.fs.starfarer.api.fleet.FleetMemberAPI;
 import com.fs.starfarer.api.impl.campaign.ids.MemFlags;
 import java.nio.ByteBuffer;
+import org.lwjgl.util.vector.Vector2f;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -30,7 +31,14 @@ public final class NpcSync {
     public static final byte NPCHOLD = 28, NPCENGAGE = 29;
 
     /** Shared NPC fleets are the default since 0.1.4.6 (F8 can still turn them off). */
-    public static boolean enabled() { return starmp.Prefs.getBool("npcSync", true); }
+    /** 0.9.3.2: a linked guest follows the HOST's setting (it used to read its own saved one, so a guest with it off ignored the stream). */
+    public static boolean enabled() {
+        try {
+            NetManager n = starmp.StarMPPlugin.net();
+            if (n != null && !n.isHost() && n.linked()) { starmp.Session.Settings s = starmp.Session.remoteSettings(); if (s != null) return s.npcSync; }
+        } catch (Throwable ignored) {}
+        return starmp.Prefs.getBool("npcSync", true);
+    }
     private static final String PUPPET = "$starmp_npcpuppet", HIDDEN = "$starmp_hidden";
 
     // ---------------------------------------------------------------- host
@@ -78,8 +86,14 @@ public final class NpcSync {
         if (full) lastFullCompNs = now;
         // locations with a guest in them, and the guests' positions
         Map<String, List<float[]>> where = new HashMap<>();
+        // 0.9.4.0: only the location the host itself is in is shared (that is the only place the host's world really runs its fleets);
+        // a guest anywhere else plays that place with its own fleets (see guestTick)
+        String hostLoc = null;
+        try { CampaignFleetAPI hp = Global.getSector().getPlayerFleet(); if (hp != null && hp.getContainingLocation() != null) hostLoc = hp.getContainingLocation().getId(); } catch (Throwable ignored) {}
+        if (tutorialActive()) hostLoc = null; // 0.9.4.0: the tutorial runs on every player's own game, nothing is streamed
         for (CampWire.Fleet g : guests.values()) {
             if (g.loc == null || g.loc.isEmpty() || now - g.recvNs > 5_000_000_000L) continue;
+            if (hostLoc == null || !hostLoc.equals(g.loc)) continue;
             where.computeIfAbsent(g.loc, k -> new ArrayList<>()).add(new float[]{g.x, g.y});
         }
         if (System.getenv("STARMP_TEST_NPC_SWARM") != null && !where.isEmpty()) testSwarm(where);
@@ -324,6 +338,8 @@ public final class NpcSync {
     private static long lastHideNs; private static int recompLogs;
     private static boolean testEngaged;
     private static int hiddenCount;
+    private static final boolean SLOW_HIDE = System.getenv("STARMP_TEST_SLOWHIDE") != null;
+    private static int leaked, leakedTotal, dimTotal; // 0.9.3.6: hidden local copies that were still visible at the start of a frame
 
     public static void dispatch(int peer, byte t, byte[] d) { onPacket(peer, t, d); }
 
@@ -365,12 +381,20 @@ public final class NpcSync {
         CampaignFleetAPI me = sector.getPlayerFleet();
         if (me == null || me.getContainingLocation() == null) return;
         LocationAPI here = me.getContainingLocation();
+        // 0.9.4.0: the host's fleets are only shared where the host itself is. Anywhere else this game runs its own fleets as normal
+        // (before, the guest hid them and the host had none there: empty systems).
+        if (!hostHere(here)) {
+            if (!puppets.isEmpty()) removeAll("the host is not in " + here.getName());
+            if (hiddenCount > 0) unhideIn(here);
+            return;
+        }
         Object[] lp = posFor(here);
         boolean fresh = lp != null && here.getId().equals(lp[0]) && System.nanoTime() - (Long) lp[3] < 5_000_000_000L;
         long now = System.nanoTime();
         if (now - lastGuestDiagNs > 10_000_000_000L) {
             lastGuestDiagNs = now;
             StarMPPlugin.flog("npc guest: data " + (lp == null ? "none" : "for " + lp[0] + " (" + ((int[]) lp[1]).length + " fleets, age " + (now - (Long) lp[3]) / 1_000_000 + " ms)") + " here=" + here.getId() + " comps=" + comps.size() + " shown=" + puppets.size());
+            try { int c = 0; StringBuilder sb = new StringBuilder("npc guest: motion"); for (Puppet q : puppets.values()) { if (c++ >= 3) break; CampaignFleetAPI f = q.fleet; Vector2f mv = f.getVelocityFromMovementModule(); sb.append(" | v=").append(r(f.getVelocity().x)).append(',').append(r(f.getVelocity().y)).append(" mod=").append(r(mv.x)).append(',').append(r(mv.y)).append(" burn=").append(f.getCurrBurnLevel()).append(" spd=").append(r(f.getTravelSpeed())); } StarMPPlugin.flog(sb.toString()); } catch (Throwable t) { StarMPPlugin.flog("npc guest: motion probe failed " + t); }
         }
         if (!fresh) {
             // right after our own battle the host hasn't had our position for a while: keep what we show for a bit
@@ -381,13 +405,17 @@ public final class NpcSync {
         // hide this game's own moving NPC fleets here: the host's are the real ones
         // every frame for fleets that just appeared here (a new local fleet was visible for up to 300 ms before:
         // a blink), the full re-force of the hidden ones every 300 ms
-        boolean fullHide = now - lastHideNs > 300_000_000L;
+        boolean fullHide = SLOW_HIDE ? now - lastHideNs > 300_000_000L : true; // 0.9.3.6: every frame (was every 300 ms: a hidden local copy faded back in between and flashed)
         if (fullHide) lastHideNs = now;
-        hideLocal(here, fullHide);
+        purgeLocal(here);
         CampaignUIAPI ui = sector.getCampaignUI();
         SectorEntityToken talking = ui.getCurrentInteractionDialog() != null ? ui.getCurrentInteractionDialog().getInteractionTarget() : null;
         int[] keys = (int[]) lp[1]; float[][] pos = (float[][]) lp[2];
-        float age = Math.min(1f, (now - (Long) lp[3]) / 1e9f);
+        float age = Math.min(2f, (now - (Long) lp[3]) / 1e9f); // 0.9.2.9: predict up to 2 s between host updates (was 1)
+        // 0.9.2.9: the glide toward the host's spot is time-based (same feel at any frame rate; was 25% per frame)
+        float frameDt = guestFrameNs == 0 ? 0f : Math.min(0.25f, (now - guestFrameNs) / 1e9f); guestFrameNs = now;
+        float glide = 1f - (float) Math.exp(-frameDt * 6f);
+        for (Puppet q : puppets.values()) { try { if (q.fleet.getSensorFaderBrightness() < 0.9f || q.fleet.getSensorContactFaderBrightness() < 0.9f) dimTotal++; } catch (Throwable ignored) {} } // 0.9.3.6 diag
         Set<Integer> live = new HashSet<>();
         for (int i = 0; i < keys.length; i++) {
             int k = keys[i]; live.add(k);
@@ -409,9 +437,10 @@ public final class NpcSync {
             if (busy) continue; // don't move a fleet we are talking to / fighting
             CampaignFleetAPI f = p.fleet;
             float dx = px - f.getLocation().x, dy = py - f.getLocation().y;
-            // snap only on a big jump; otherwise glide toward the predicted spot so motion stays smooth between packets
-            if (dx * dx + dy * dy > 600f * 600f) f.setLocation(px, py);
-            else f.setLocation(f.getLocation().x + dx * 0.25f, f.getLocation().y + dy * 0.25f);
+            // snap only on a real teleport (jump point, new spawn); otherwise glide toward the predicted spot, so a
+            // fleet that got ahead / behind slides back over about half a second instead of jumping
+            if (dx * dx + dy * dy > 1500f * 1500f) { f.setLocation(px, py); snapsNpc++; }
+            else f.setLocation(f.getLocation().x + dx * glide, f.getLocation().y + dy * glide);
             f.setVelocity(pos[i][2], pos[i][3]);
             f.setMoveDestinationOverride(px + pos[i][2] * 0.5f, py + pos[i][3] * 0.5f);
             if (sector.isPaused()) { try { f.advance(0.001f); } catch (Throwable ignored) {} }
@@ -467,6 +496,9 @@ public final class NpcSync {
             if (!busy && (gone || (!live.contains(p.key) && now - p.seenNs > 6_000_000_000L))) { despawn(p); it.remove(); }
         }
     }
+
+    private static long guestFrameNs;
+    static int snapsNpc; // debug log: hard snaps (should stay near 0)
 
     private static void reportLosses(NetManager net, Puppet p) {
         List<FleetMemberAPI> now = p.fleet.isAlive() ? p.fleet.getFleetData().getMembersListCopy() : Collections.<FleetMemberAPI>emptyList();
@@ -534,8 +566,54 @@ public final class NpcSync {
         puppets.clear();
     }
 
-    private static void hideLocal(LocationAPI here, boolean full) {
+    /** Guest: is the host's player fleet in this location right now (so its fleets here are the real ones)? */
+    static boolean hostHere(LocationAPI here) {
+        if (tutorialActive()) return false;
+        try {
+            CampWire.Fleet h = CoopCampaign.fleets.get(0);
+            return h != null && here != null && here.getId().equals(h.loc) && System.nanoTime() - h.recvNs < 8_000_000_000L;
+        } catch (Throwable t) { return false; }
+    }
+
+    /** 0.9.4.0: the vanilla tutorial (rogue miner, scripted pirates) is still running in this game: it is local to each player, so the host's
+     * copies of its fleets are neither sent nor shown. */
+    static boolean tutorialActive() {
+        try { if (com.fs.starfarer.api.impl.campaign.tutorial.TutorialMissionIntel.isTutorialInProgress()) return true; } catch (Throwable ignored) {}
+        try {
+            for (com.fs.starfarer.api.EveryFrameScript sc : Global.getSector().getScripts())
+                if (sc instanceof com.fs.starfarer.api.impl.campaign.tutorial.CampaignTutorialScript && !sc.isDone()) return true;
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    private static int purged;
+    /** 0.9.4.0: where the host's fleets are shown, this game's own NPC fleets must not exist at all - a hidden fleet still flies, pings the
+     * sensors and can ambush the player unseen. They are removed (and removed again whenever the game spawns a new one). */
+    private static void purgeLocal(LocationAPI here) {
         int n = 0; StringBuilder names = new StringBuilder();
+        for (CampaignFleetAPI f : new ArrayList<>(here.getFleets())) {
+            if (!isNpc(f) || ownMissionFleet(f)) continue;
+            try { if (f.getBattle() != null) continue; } catch (Throwable ignored) {}
+            if (names.length() < 200) names.append(f.getName()).append(" [").append(f.getFaction().getId()).append("]; ");
+            try { f.despawn(CampaignEventListener.FleetDespawnReason.OTHER, null); }
+            catch (Throwable t) { try { here.removeEntity(f); } catch (Throwable ignored) {} }
+            n++;
+        }
+        if (n > 0) { purged += n; StarMPPlugin.flog("npc: removed " + n + " local NPC fleet(s) in " + here.getName() + " (the host's are shown instead; total " + purged + "): " + names); }
+    }
+
+    /** The host left this location: clear the hide flags on any fleet that is still marked (old saves / older builds). */
+    private static void unhideIn(LocationAPI here) {
+        for (CampaignFleetAPI f : here.getFleets()) {
+            MemoryAPI m = f.getMemoryWithoutUpdate();
+            if (!m.contains(HIDDEN)) continue;
+            m.unset(HIDDEN); m.unset(MemFlags.FLEET_IGNORES_OTHER_FLEETS); m.unset(MemFlags.FLEET_IGNORED_BY_OTHER_FLEETS);
+            f.setAlwaysUseSensorFaderBrightness(null);
+        }
+    }
+
+    private static void hideLocal(LocationAPI here, boolean full) {
+        int n = 0; StringBuilder names = new StringBuilder(); leaked = 0;
         for (CampaignFleetAPI f : here.getFleets()) {
             if (!isNpc(f)) continue;
             MemoryAPI m = f.getMemoryWithoutUpdate();
@@ -545,6 +623,7 @@ public final class NpcSync {
             }
             boolean fresh = !m.contains(HIDDEN);
             if (!fresh && !full) continue;
+            if (!fresh) { try { if (f.getSensorFaderBrightness() > 0.02f || f.getSensorContactFaderBrightness() > 0.02f) leaked++; } catch (Throwable ignored) {} }
             if (fresh) {
                 if (names.length() < 200) names.append(f.getName()).append(" [").append(f.getFaction().getId()).append("]; ");
                 m.set(HIDDEN, true);
@@ -557,6 +636,7 @@ public final class NpcSync {
             f.forceSensorContactFaderBrightness(0f);
             f.setNoEngaging(5f);
         }
+        if (leaked > 0) leakedTotal += leaked;
         if (n > 0) { hiddenCount += n; StarMPPlugin.flog("npc: hid " + n + " local NPC fleet(s) in " + here.getName() + " (host's are shown instead): " + names); }
     }
 
@@ -615,8 +695,8 @@ public final class NpcSync {
             float age = Math.min(1f, (now - (Long) lp[3]) / 1e9f); ageMs = (now - (Long) lp[3]) / 1_000_000;
             for (int i = 0; i < keys.length; i++) hostNow.put(keys[i], new float[]{pos[i][0] + pos[i][2] * age, pos[i][1] + pos[i][3] * age, pos[i][4]});
         }
-        out.add("NPC-SUM data=" + (lp == null ? "none" : lp[0] + " age_ms=" + ((now - (Long) lp[3]) / 1_000_000) + " fleets=" + ((int[]) lp[1]).length)
-                + " here=" + (here == null ? "-" : here.getId()) + " comps=" + comps.size() + " shown=" + puppets.size() + " destroyed_mem=" + destroyed.size() + " hidden_total=" + hiddenCount);
+        out.add("NPC-SUM snaps=" + snapsNpc + " data=" + (lp == null ? "none" : lp[0] + " age_ms=" + ((now - (Long) lp[3]) / 1_000_000) + " fleets=" + ((int[]) lp[1]).length)
+                + " here=" + (here == null ? "-" : here.getId()) + " comps=" + comps.size() + " shown=" + puppets.size() + " destroyed_mem=" + destroyed.size() + " hidden_total=" + hiddenCount + " leaked_frames=" + leakedTotal + " puppet_dim_frames=" + dimTotal);
         for (Puppet p : puppets.values()) {
             CampaignFleetAPI f = p.fleet;
             float[] h = hostNow.get(p.key);

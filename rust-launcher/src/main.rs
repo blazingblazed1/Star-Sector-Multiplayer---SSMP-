@@ -3,10 +3,12 @@
 //! WHAT IT DOES (plain words, for anyone reading the source):
 //!  - Shows a small window in the Starsector launcher's own style (it loads Starsector's launcher artwork from the
 //!    player's own install - nothing of Starsector's is copied into this program).
-//!  - "Single Player": unticks SSMP in Starsector's mod list (mods/enabled_mods.json - the file Starsector's own
-//!    launcher edits), starts Starsector, and exits. No logging.
-//!  - "Multiplayer": FIRST starts the SSMP crash logger (a report file in mods/StarMP/crash logs, or wherever the
-//!    player chose in F8), THEN ticks SSMP in the mod list and starts Starsector. Until the mod is running in the game
+//!  - "IROH" / "LAN" (0.9.1.6): which way SSMP connects. Both FIRST start the SSMP crash logger (a report file in
+//!    mods/StarMP/crash logs, or wherever the player chose in F8), THEN tick SSMP in Starsector's mod list
+//!    (mods/enabled_mods.json - the file Starsector's own launcher edits) and start Starsector. IROH = online, through
+//!    a join code (direct, or through Iroh's relays when a direct link isn't possible); LAN = direct connections only,
+//!    no internet relays (same as the "LAN / direct only" box in the game). The choice is passed to the game as the
+//!    environment variable STARMP_NET (iroh / lan). Until the mod is running in the game
 //!    it copies Starsector's own log lines into the report; once the mod loads, the mod's logger takes the file over.
 //!    If the game ends before that (closed, crashed, killed), it finishes the report: deleted on a normal exit, kept
 //!    with the end of starsector.log otherwise.
@@ -21,7 +23,7 @@ use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, TextureHandle, Vec2
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, PartialEq)]
-enum Choice { Single, Multi }
+enum Choice { Iroh, Lan }
 
 struct App {
     paths: Result<game::Paths, String>,
@@ -110,11 +112,11 @@ impl eframe::App for App {
                     ui.painter().text(Pos2::new(cx, 86.0), egui::Align2::CENTER_TOP, format!("SSMP {}  -  Starsector Multiplayer", self.ssmp_version), FontId::proportional(15.0), cyan);
                     ui.painter().text(Pos2::new(cx, 106.0), egui::Align2::CENTER_TOP,
                         format!("SSMP is currently {} in your mod list", if self.ssmp_on { "ON" } else { "OFF" }), FontId::proportional(11.5), Color32::from_rgb(160, 180, 200));
-                    let single = self.button(ui, 166.0, "Single Player", "vanilla - unticks SSMP");
-                    let multi = self.button(ui, 256.0, "Multiplayer", if self.logger_off { "ticks SSMP" } else { "ticks SSMP + starts the crash logger first" });
-                    let foot = "Your other mods are not changed. You can still tick or untick\nmods in the Starsector launcher that opens next.";
+                    let iroh = self.button(ui, 166.0, "IROH", "online - share a join code, no port forwarding");
+                    let lan = self.button(ui, 256.0, "LAN", "direct / same network only - no internet relays");
+                    let foot = "Both tick SSMP - your other mods stay as they are.";
                     ui.painter().text(Pos2::new(cx, 312.0), egui::Align2::CENTER_TOP, foot, FontId::proportional(10.5), Color32::from_rgb(150, 170, 190));
-                    let pick = if single { Some(Choice::Single) } else if multi { Some(Choice::Multi) } else { None };
+                    let pick = if iroh { Some(Choice::Iroh) } else if lan { Some(Choice::Lan) } else { None };
                     if let Some(c) = pick {
                         if let Ok(mut g) = self.choice.lock() { *g = Some(c); }
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -143,11 +145,8 @@ fn main() {
     let picked = *choice.lock().unwrap();
     let Ok(paths) = paths else { return };
     match picked {
-        Some(Choice::Single) => {
-            paths.set_ssmp(false);
-            if let Err(e) = paths.launch(None) { game::fatal(&format!("could not start Starsector: {e}")); }
-        }
-        Some(Choice::Multi) => game::multiplayer(paths),
+        Some(Choice::Iroh) => game::multiplayer(paths, false),
+        Some(Choice::Lan) => game::multiplayer(paths, true),
         None => {}
     }
 }

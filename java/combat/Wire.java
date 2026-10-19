@@ -107,6 +107,8 @@ public final class Wire {
         public boolean fighterLike;
         public int player = -1;   // net id of the player who owns this ship (-1 = AI/NPC)
         public boolean ally;      // spawned as an ally (blue, not commandable)
+        /** 0.9.1.9: the player's own weapon groups, each "TYPE|autofire 0/1|slot,slot..." (empty = let the game make them) */
+        public final List<String> groups = new ArrayList<>();
     }
 
     public static final class ProjSpawn {
@@ -246,13 +248,13 @@ public final class Wire {
     /** type = SHIPDEFS or JOINFLEET; flag = flagship id for JOINFLEET. */
     public static byte[] encodeDefs(byte type, int flag, List<ShipDef> defs) {
         int size = 1 + 4 + 2;
-        for (ShipDef d : defs) size += 8 + 4 + 1 + 2 + 2 + 1 + 2 + sl(d.hullId) + sl(d.name) + listLen(d.slots) + listLen(d.weapons) + listLen(d.mods) + listLen(d.wings);
+        for (ShipDef d : defs) size += 8 + 4 + 1 + 2 + 2 + 1 + 2 + sl(d.hullId) + sl(d.name) + listLen(d.slots) + listLen(d.weapons) + listLen(d.mods) + listLen(d.wings) + listLen(d.groups);
         ByteBuffer b = ByteBuffer.allocate(size);
         b.put(type); b.putInt(flag); b.putShort((short) defs.size());
         for (ShipDef d : defs) {
             b.putFloat(d.cr); b.putFloat(d.hullFrac);
             b.putInt(d.id); b.put((byte) d.owner); b.putShort((short) d.vents); b.putShort((short) d.caps); b.put((byte) (d.fighterLike ? 1 : 0)); b.put((byte) d.player); b.put((byte) (d.ally ? 1 : 0));
-            ps(b, d.hullId); ps(b, d.name); pl(b, d.slots); pl(b, d.weapons); pl(b, d.mods); pl(b, d.wings);
+            ps(b, d.hullId); ps(b, d.name); pl(b, d.slots); pl(b, d.weapons); pl(b, d.mods); pl(b, d.wings); pl(b, d.groups);
         }
         return done(b);
     }
@@ -267,7 +269,7 @@ public final class Wire {
             ShipDef d = new ShipDef();
             d.cr = b.getFloat(); d.hullFrac = b.getFloat();
             d.id = b.getInt(); d.owner = b.get(); d.vents = b.getShort(); d.caps = b.getShort(); d.fighterLike = b.get() != 0; d.player = b.get(); d.ally = b.get() != 0;
-            d.hullId = gs(b); d.name = gs(b); gl(b, d.slots); gl(b, d.weapons); gl(b, d.mods); gl(b, d.wings);
+            d.hullId = gs(b); d.name = gs(b); gl(b, d.slots); gl(b, d.weapons); gl(b, d.mods); gl(b, d.wings); gl(b, d.groups);
             out.add(d);
         }
         return out;

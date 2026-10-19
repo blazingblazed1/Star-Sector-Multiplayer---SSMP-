@@ -20,6 +20,9 @@ pub struct Paths {
     pub mods: PathBuf,
     pub ssmp: PathBuf,
     pub saves: PathBuf,
+    /// 0.1.4: packaged installs (NixOS): the game's own start command (the game folder itself is read-only and the
+    /// mods / saves live in a separate data folder, e.g. ~/.local/share/starsector). None = starsector.exe / .sh.
+    pub cmd: Option<PathBuf>,
 }
 
 pub fn fatal(msg: &str) {
@@ -48,15 +51,33 @@ impl Paths {
                 let mods = d.join("mods");
                 let ssmp = exe.parent().and_then(Path::parent).filter(|p| p.join("mod_info.json").exists())
                     .map(Path::to_path_buf).unwrap_or_else(|| mods.join("StarMP"));
-                return Ok(Paths { saves: d.join("saves"), root: d, core, mods, ssmp });
+                return Ok(Paths { saves: d.join("saves"), root: d, core, mods, ssmp, cmd: None });
             }
             dir = d.parent().map(Path::to_path_buf);
+        }
+        // 0.1.4: packaged installs (NixOS): this program is in <data>/mods/StarMP/bin and the game is started by the
+        // "starsector" command on the PATH, whose real file is <package>/bin/starsector next to <package>/share/starsector
+        if !cfg!(windows) {
+            let ssmp_dir = exe.parent().and_then(Path::parent).map(Path::to_path_buf);
+            let data = ssmp_dir.as_deref().and_then(Path::parent).and_then(Path::parent).map(Path::to_path_buf);
+            if let (Some(ssmp), Some(data), Some(cmd)) = (ssmp_dir, data, which("starsector")) {
+                if data.join("mods").is_dir() {
+                    let real = std::fs::canonicalize(&cmd).unwrap_or_else(|_| cmd.clone());
+                    let core = real.parent().and_then(Path::parent).map(|p| p.join("share").join("starsector"))
+                        .filter(|s| s.join("graphics").is_dir()).unwrap_or_else(|| data.clone());
+                    return Ok(Paths { saves: data.join("saves"), mods: data.join("mods"), root: data, core, ssmp, cmd: Some(cmd) });
+                }
+            }
         }
         Err(format!("Could not find the Starsector folder above {}.\n\nThe SSMP launcher must stay in mods/StarMP/bin inside your Starsector folder - reinstall SSMP with the installer.", exe.display()))
     }
 
     pub fn ui_graphics(&self) -> PathBuf { self.core.join("graphics").join("ui") }
-    pub fn starsector_log(&self) -> PathBuf { self.core.join("starsector.log") }
+    pub fn starsector_log(&self) -> PathBuf {
+        // packaged installs write it into the data folder (the game folder is read-only)
+        if self.cmd.is_some() && self.root.join("starsector.log").exists() { return self.root.join("starsector.log"); }
+        self.core.join("starsector.log")
+    }
 
     /// SSMP's version from its mod_info.json (read every time, so the launcher never needs updating for it).
     /** The mod build has its debug logger switched off. */
@@ -109,7 +130,8 @@ impl Paths {
 
     /// Starts Starsector the normal way (its own launcher window opens).
     pub fn launch(&self, env: Option<&[(&str, String)]>) -> std::io::Result<Child> {
-        let mut c = if cfg!(windows) { Command::new(self.root.join("starsector.exe")) } else { let mut c = Command::new("sh"); c.arg(self.root.join("starsector.sh")); c };
+        let mut c = if let Some(cmd) = &self.cmd { Command::new(cmd) }
+            else if cfg!(windows) { Command::new(self.root.join("starsector.exe")) } else { let mut c = Command::new("sh"); c.arg(self.root.join("starsector.sh")); c };
         c.current_dir(&self.root).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         if let Some(env) = env { for (k, v) in env { c.env(k, v); } }
         c.spawn()
@@ -119,6 +141,11 @@ impl Paths {
 }
 
 // ------------------------------------------------------------------------------------------------ time
+
+/// A program on the PATH (packaged installs).
+fn which(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join(name)).find(|f| f.is_file()))
+}
 
 fn civil(ms: i64) -> (i64, u32, u32, u32, u32, u32, u32) {
     let secs = ms.div_euclid(1000);
@@ -217,18 +244,18 @@ fn hw_header(p: &Paths) -> String {
 
 /// Multiplayer: crash logger first, then SSMP ticked, then Starsector. Watches the game until the mod's logger takes
 /// the report over, or until the game ends (then finishes the report itself).
-pub fn multiplayer(p: Paths) {
+pub fn multiplayer(p: Paths, lan: bool) {
     // a build with the debug logger switched off ships bin/logger.off: no crash report from here either
     let pre = if p.logger_off() { None } else { PreLog::start(&p) };
     p.set_ssmp(true);
-    let mut env: Vec<(&str, String)> = vec![("STARMP_LAUNCHER", LAUNCHER_VERSION.to_string())];
+    let mut env: Vec<(&str, String)> = vec![("STARMP_LAUNCHER", LAUNCHER_VERSION.to_string()), ("STARMP_NET", (if lan { "lan" } else { "iroh" }).to_string())];
     if let Some(l) = &pre { env.push(("STARMP_PRELOG", l.path.display().to_string())); }
     let child = match p.launch(Some(&env)) {
         Ok(c) => c,
         Err(e) => { if let Some(l) = &pre { l.line("LAUNCHER", &format!("could not start Starsector: {e}")); } fatal(&format!("Could not start Starsector: {e}")); return; }
     };
     let Some(pre) = pre else { return }; // logging turned off: nothing to watch
-    pre.line("LAUNCHER", &format!("Starsector started (pid {}) - SSMP ticked in the mod list", child.id()));
+    pre.line("LAUNCHER", &format!("Starsector started (pid {}) - SSMP ticked in the mod list, {}", child.id(), if lan { "LAN" } else { "IROH" }));
     watch(&p, &pre, child);
 }
 
