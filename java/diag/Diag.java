@@ -29,7 +29,7 @@ public final class Diag {
      * helper logging, no files, no hardware probe, no F9/F10, and Host/Join work without the SSMP launcher.
      * (Env STARMP_DIAG=1 turns it back on for the developer's test rig.)
      */
-    public static final boolean BUILD_LOGGER = true;
+    public static final boolean BUILD_LOGGER = false;
     public static boolean active() { return BUILD_LOGGER || "1".equals(System.getenv("STARMP_DIAG")); }
 
     public static boolean enabled() { return active() && Prefs.getBool("debugLog", true); }
