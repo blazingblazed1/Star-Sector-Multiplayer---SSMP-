@@ -17,7 +17,7 @@ Starsector Multiplayer: no longer a theory, it's reality.
 
 Starsector now runs 4-player co-op, and you're not watching the same screen. Each player runs their own engine on their own PC. Hosting uses IROH, and you connect to your host with an in-game ticket. No port forwarding, no Hamachi: the host clicks "Copy Ticket," friends click "Paste Code" in-game.
 
-You all spawn in the tutorial sector, the tutorial missions are synchronized, and you leave the tutorial sector together as a group jump. Then the game begins.
+You all spawn in the tutorial sector, the tutorial missions are individual, and you leave the tutorial sector together as a group jump. Then the game begins.
 
 • Everyone has their own fleet for flying around, taking missions, or trading.
 • You can join a friend's battle mid-fight when they're screaming in VC flying in circles trying not to die.
@@ -27,7 +27,9 @@ You all spawn in the tutorial sector, the tutorial missions are synchronized, an
 
 There are bugs, but it works. The early stages are done and need testing.
 Current status
-The 4-player campaign works right now. I've tested with 1–2 other players and run four sandboxes on my own PC, and everything has worked so far. Before releasing a public branch, I'd like 10–20 playtesters for a few hours to make sure it's solid. Once the important bugs are fixed (which should only take me a couple of hours), I'll release it officially on Nexus Mods.
+The 4-player campaign works right now. I've tested with 1–2 other players and run four sandboxes on my own PC, and everything has worked so far. Before releasing a public branch, I'd like 10–20 playtesters for a few hours to make sure it's solid. Once the important bugs are fixed (which should only take me a couple of hours), I'll release it officially on Nexus Mods and forums
+
+a 47 client test with multiple players using sandboxes has been completed, host max internet was 7.6 d/s and 7.8 u/s with 47 connected players and sandboxes, will release a server version later on 
 
 The long-term vision (feel free to skip)
 • A procedural, octagon-shaped galaxy. Each faction gets a large home region with its HQ and is pushed to expand and go to war for more sectors and resources.
